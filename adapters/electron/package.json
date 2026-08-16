@@ -1,0 +1,25 @@
+{
+  "name": "@debug-logging-toolkit/electron",
+  "version": "0.1.0",
+  "description": "Electron main and renderer adapters for Debug Logging Toolkit JSONL logs",
+  "type": "module",
+  "main": "dist/main.js",
+  "types": "dist/main.d.ts",
+  "exports": {
+    ".": "./dist/main.js",
+    "./renderer": "./dist/renderer.js",
+    "./schema": "./dist/schema.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/*.test.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

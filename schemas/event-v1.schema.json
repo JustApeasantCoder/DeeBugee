@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debugloggingtoolkit.dev/schema/event-v1.schema.json",
+  "title": "Debug Logging Toolkit Event v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "timestamp",
+    "level",
+    "source",
+    "subsystem",
+    "event",
+    "message",
+    "app_session_id"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "timestamp": {
+      "description": "Unix epoch milliseconds. RFC 3339 text is accepted for compatibility with early adapters.",
+      "oneOf": [
+        { "type": "integer" },
+        { "type": "string", "format": "date-time" }
+      ]
+    },
+    "level": {
+      "type": "string",
+      "enum": ["trace", "debug", "info", "warn", "error", "fatal"]
+    },
+    "source": { "type": "string", "minLength": 1 },
+    "subsystem": { "type": "string", "minLength": 1 },
+    "target": { "type": "string" },
+    "event": { "type": "string", "minLength": 1 },
+    "message": { "type": "string" },
+    "app_session_id": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "number" }
+      ]
+    },
+    "playback_session_id": { "type": ["string", "number"] },
+    "request_id": { "type": ["string", "number"] },
+    "session_id": { "type": ["string", "number"] },
+    "provider": { "type": "string" },
+    "duration_ms": { "type": "number", "minimum": 0 },
+    "error_kind": { "type": "string" },
+    "status": {},
+    "fields": { "type": "object" }
+  },
+  "additionalProperties": true
+}
