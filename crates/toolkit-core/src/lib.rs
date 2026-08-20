@@ -1,4 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    sync::Arc,
+};
 
 use dee_bugee_schema::{Level, LogEvent, scalar_text};
 use roaring::RoaringBitmap;
@@ -7,9 +11,10 @@ use serde_json::Value;
 
 pub const DEFAULT_MAX_EVENTS: usize = 250_000;
 
-pub const PRIMARY_FACETS: [&str; 11] = [
+pub const PRIMARY_FACETS: [&str; 12] = [
     "level",
     "source",
+    "tag",
     "subsystem",
     "target",
     "event",
@@ -78,6 +83,7 @@ impl FilterState {
 #[derive(Debug)]
 pub struct EventStore {
     events: Vec<LogEvent>,
+    search_documents: Vec<Arc<str>>,
     indexes: BTreeMap<String, BTreeMap<String, RoaringBitmap>>,
     max_events: usize,
     discarded_events: u64,
@@ -93,6 +99,7 @@ impl EventStore {
     pub fn new(max_events: usize) -> Self {
         Self {
             events: Vec::with_capacity(max_events.min(16_384)),
+            search_documents: Vec::with_capacity(max_events.min(16_384)),
             indexes: BTreeMap::new(),
             max_events: max_events.clamp(1, u32::MAX as usize),
             discarded_events: 0,
@@ -119,12 +126,14 @@ impl EventStore {
         if self.events.len() >= self.max_events {
             let prune_count = (self.max_events / 10).max(1);
             self.events.drain(..prune_count);
+            self.search_documents.drain(..prune_count);
             self.discarded_events += prune_count as u64;
             self.rebuild_indexes();
         }
 
         let index = self.events.len() as u32;
         self.index_event(index, &event);
+        self.search_documents.push(search_document(&event));
         self.events.push(event);
     }
 
@@ -139,13 +148,68 @@ impl EventStore {
     }
 
     pub fn query(&self, filter: &FilterState) -> Vec<usize> {
-        self.query_bitmap(filter, None)
+        let text_matches = self.search_matches(&filter.text);
+        self.query_bitmap(filter, None, text_matches.as_deref())
             .iter()
             .map(|index| index as usize)
             .collect()
     }
 
     pub fn facet_counts(&self, facet: &str, filter: &FilterState) -> Vec<(String, u64)> {
+        let text_matches = self.search_matches(&filter.text);
+        self.facet_counts_with_matches(facet, filter, text_matches.as_deref())
+    }
+
+    pub fn query_with_facets(
+        &self,
+        filter: &FilterState,
+        facets: &[String],
+        text_matches: Option<&[usize]>,
+    ) -> FilterResults {
+        let rows = self
+            .query_bitmap(filter, None, text_matches)
+            .iter()
+            .map(|index| index as usize)
+            .collect();
+        let facet_counts = facets
+            .iter()
+            .map(|facet| {
+                (
+                    facet.clone(),
+                    self.facet_counts_with_matches(facet, filter, text_matches),
+                )
+            })
+            .collect();
+        FilterResults { rows, facet_counts }
+    }
+
+    pub fn search_snapshot(&self, start_index: usize) -> SearchSnapshot {
+        let start_index = start_index.min(self.search_documents.len());
+        SearchSnapshot {
+            start_index,
+            documents: self.search_documents[start_index..].to_vec(),
+        }
+    }
+
+    fn search_matches(&self, query: &str) -> Option<Vec<usize>> {
+        let terms = search_terms(query);
+        (!terms.is_empty()).then(|| {
+            self.search_documents
+                .iter()
+                .enumerate()
+                .filter_map(|(index, document)| {
+                    document_matches_terms(document, &terms).then_some(index)
+                })
+                .collect()
+        })
+    }
+
+    fn facet_counts_with_matches(
+        &self,
+        facet: &str,
+        filter: &FilterState,
+        text_matches: Option<&[usize]>,
+    ) -> Vec<(String, u64)> {
         let Some(values) = self.indexes.get(facet) else {
             return Vec::new();
         };
@@ -156,7 +220,8 @@ impl EventStore {
                 .facets
                 .iter()
                 .any(|(name, selection)| name != facet && !selection.is_empty());
-        let candidates = has_other_filters.then(|| self.query_bitmap(filter, Some(facet)));
+        let candidates =
+            has_other_filters.then(|| self.query_bitmap(filter, Some(facet), text_matches));
 
         let mut counts: Vec<_> = values
             .iter()
@@ -172,8 +237,23 @@ impl EventStore {
         counts
     }
 
-    fn query_bitmap(&self, filter: &FilterState, ignored_facet: Option<&str>) -> RoaringBitmap {
-        let mut result: RoaringBitmap = (0..self.events.len() as u32).collect();
+    fn query_bitmap(
+        &self,
+        filter: &FilterState,
+        ignored_facet: Option<&str>,
+        text_matches: Option<&[usize]>,
+    ) -> RoaringBitmap {
+        let mut result: RoaringBitmap = text_matches.map_or_else(
+            || (0..self.events.len() as u32).collect(),
+            |matches| {
+                matches
+                    .iter()
+                    .copied()
+                    .filter(|index| *index < self.events.len())
+                    .map(|index| index as u32)
+                    .collect()
+            },
+        );
 
         for (facet, selection) in &filter.facets {
             if ignored_facet == Some(facet.as_str()) || selection.is_empty() {
@@ -228,53 +308,7 @@ impl EventStore {
             }
         }
 
-        let terms = search_terms(&filter.text);
-        if !terms.is_empty() {
-            result = result
-                .iter()
-                .filter(|index| self.event_matches_terms(*index as usize, &terms))
-                .collect();
-        }
-
         result
-    }
-
-    fn event_matches_terms(&self, index: usize, terms: &[String]) -> bool {
-        let Some(event) = self.events.get(index) else {
-            return false;
-        };
-
-        let primary_text = [
-            event.message.as_str(),
-            event.event.as_str(),
-            event.subsystem.as_str(),
-            event.source.as_str(),
-            event.correlation_id(),
-        ];
-        terms.iter().all(|term| {
-            primary_text
-                .iter()
-                .any(|text| fuzzy_text_contains(text, term))
-                || event
-                    .target
-                    .as_deref()
-                    .is_some_and(|text| fuzzy_text_contains(text, term))
-                || event
-                    .provider
-                    .as_deref()
-                    .is_some_and(|text| fuzzy_text_contains(text, term))
-                || event
-                    .error_kind
-                    .as_deref()
-                    .is_some_and(|text| fuzzy_text_contains(text, term))
-                || event
-                    .status
-                    .as_ref()
-                    .is_some_and(|value| fuzzy_text_contains(&value.to_string(), term))
-                || event.fields.iter().any(|(key, value)| {
-                    fuzzy_text_contains(key, term) || fuzzy_text_contains(&value.to_string(), term)
-                })
-        })
     }
 
     fn rebuild_indexes(&mut self) {
@@ -289,6 +323,7 @@ impl EventStore {
     fn index_event(&mut self, index: u32, event: &LogEvent) {
         self.add_index("level", event.level.to_string(), index);
         self.add_index("source", event.source.clone(), index);
+        self.add_index("tag", event.tag(), index);
         self.add_index("subsystem", event.subsystem.clone(), index);
         self.add_optional_index("target", event.target.as_deref(), index);
         self.add_index("event", event.event.clone(), index);
@@ -329,6 +364,71 @@ impl EventStore {
     }
 }
 
+#[derive(Debug)]
+pub struct FilterResults {
+    pub rows: Vec<usize>,
+    pub facet_counts: BTreeMap<String, Vec<(String, u64)>>,
+}
+
+#[derive(Debug)]
+pub struct SearchSnapshot {
+    start_index: usize,
+    documents: Vec<Arc<str>>,
+}
+
+impl SearchSnapshot {
+    pub fn search(&self, query: &str, mut cancelled: impl FnMut() -> bool) -> Option<Vec<usize>> {
+        let terms = search_terms(query);
+        if terms.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut matches = Vec::new();
+        for (offset, document) in self.documents.iter().enumerate() {
+            if offset % 256 == 0 && cancelled() {
+                return None;
+            }
+            if document_matches_terms(document, &terms) {
+                matches.push(self.start_index + offset);
+            }
+        }
+        Some(matches)
+    }
+}
+
+fn search_document(event: &LogEvent) -> Arc<str> {
+    let mut text = String::with_capacity(event.message.len() + 192);
+    for value in [
+        event.message.as_str(),
+        event.event.as_str(),
+        event.subsystem.as_str(),
+        event.source.as_str(),
+        event.correlation_id(),
+    ] {
+        let _ = write!(text, " {value}");
+    }
+    for value in [
+        event.target.as_deref(),
+        event.provider.as_deref(),
+        event.error_kind.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = write!(text, " {value}");
+    }
+    if let Some(status) = &event.status {
+        let _ = write!(text, " {status}");
+    }
+    for (key, value) in &event.fields {
+        let _ = write!(text, " {key} {value}");
+    }
+    Arc::from(text.to_ascii_lowercase())
+}
+
+fn document_matches_terms(document: &str, terms: &[String]) -> bool {
+    terms.iter().all(|term| fuzzy_text_contains(document, term))
+}
+
 fn search_terms(query: &str) -> Vec<String> {
     query
         .split(|character: char| !character.is_alphanumeric())
@@ -338,7 +438,6 @@ fn search_terms(query: &str) -> Vec<String> {
 }
 
 fn fuzzy_text_contains(text: &str, term: &str) -> bool {
-    let text = text.to_ascii_lowercase();
     if text.contains(term) {
         return true;
     }
@@ -357,8 +456,11 @@ fn edit_distance_within(left: &[u8], right: &[u8], maximum: usize) -> bool {
         return false;
     }
 
-    let mut previous: Vec<usize> = (0..=right.len()).collect();
-    let mut current = vec![0; right.len() + 1];
+    let mut previous = [0; 65];
+    let mut current = [0; 65];
+    for (index, value) in previous.iter_mut().enumerate().take(right.len() + 1) {
+        *value = index;
+    }
     for (left_index, left_byte) in left.iter().enumerate() {
         current[0] = left_index + 1;
         let mut row_minimum = current[0];
@@ -412,6 +514,43 @@ mod tests {
         let source = filter.facets.get_mut("source").unwrap();
         source.included.clear();
         source.toggle_exclude("renderer");
+        assert_eq!(store.query(&filter), vec![0, 1]);
+    }
+
+    #[test]
+    fn tag_facet_groups_the_same_feature_across_sources() {
+        let mut store = EventStore::new(100);
+        store.extend([
+            event(
+                Level::Debug,
+                "backend",
+                "segment_detection.local",
+                "[Segment Detection][Local] analysis started",
+            ),
+            event(
+                Level::Debug,
+                "renderer",
+                "segment_detection.remote",
+                "[Segment Detection][Remote] lookup started",
+            ),
+            event(
+                Level::Info,
+                "renderer",
+                "whisperlive",
+                "[WhisperLive] session started",
+            ),
+        ]);
+
+        assert_eq!(
+            store.facet_counts("tag", &FilterState::default()),
+            vec![("Segment Detection".into(), 2), ("WhisperLive".into(), 1)]
+        );
+        let mut filter = FilterState::default();
+        filter
+            .facets
+            .entry("tag".into())
+            .or_default()
+            .include_only("Segment Detection");
         assert_eq!(store.query(&filter), vec![0, 1]);
     }
 
@@ -511,5 +650,61 @@ mod tests {
 
         filter.text = "segment remote".to_string();
         assert!(store.query(&filter).is_empty());
+    }
+
+    #[test]
+    fn one_search_result_is_reused_for_rows_and_facets() {
+        let mut store = EventStore::new(100);
+        store.extend([
+            event(Level::Info, "backend", "sync", "cache connected"),
+            event(Level::Warn, "renderer", "sync", "cache delayed"),
+            event(Level::Error, "backend", "player", "decoder failed"),
+        ]);
+        let filter = FilterState {
+            text: "cache".to_string(),
+            ..FilterState::default()
+        };
+        let matches = store.search_snapshot(0).search("cache", || false).unwrap();
+        let facets = vec!["source".to_string(), "subsystem".to_string()];
+        let results = store.query_with_facets(&filter, &facets, Some(&matches));
+
+        assert_eq!(results.rows, vec![0, 1]);
+        assert_eq!(
+            results.facet_counts["source"],
+            vec![("backend".into(), 1), ("renderer".into(), 1)]
+        );
+        assert_eq!(results.facet_counts["subsystem"], vec![("sync".into(), 2)]);
+    }
+
+    #[test]
+    fn snapshots_support_incremental_search_and_cancellation() {
+        let mut store = EventStore::new(100);
+        store.extend([
+            event(Level::Info, "backend", "sync", "first match"),
+            event(Level::Info, "backend", "sync", "unrelated"),
+        ]);
+        let initial = store.search_snapshot(0).search("match", || false).unwrap();
+        assert_eq!(initial, vec![0]);
+
+        store.push(event(Level::Info, "renderer", "sync", "second match"));
+        let incremental = store.search_snapshot(2).search("match", || false).unwrap();
+        assert_eq!(incremental, vec![2]);
+        assert!(store.search_snapshot(0).search("match", || true).is_none());
+    }
+
+    #[test]
+    fn structured_fields_are_normalized_once_and_remain_searchable() {
+        let mut event = event(Level::Info, "backend", "sync", "request finished");
+        event
+            .fields
+            .insert("CacheRegion".into(), Value::String("Asia-East".into()));
+        let mut store = EventStore::new(100);
+        store.push(event);
+
+        let filter = FilterState {
+            text: "cacheregion asia-east".to_string(),
+            ..FilterState::default()
+        };
+        assert_eq!(store.query(&filter), vec![0]);
     }
 }

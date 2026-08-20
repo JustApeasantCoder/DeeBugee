@@ -166,6 +166,58 @@ impl LogEvent {
         self.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)
     }
 
+    pub fn tag(&self) -> String {
+        const CONTEXT_SEGMENTS: [&str; 7] = [
+            "backend", "frontend", "local", "remote", "renderer", "settings", "sidecar",
+        ];
+
+        let message_segments: Vec<&str> = self
+            .message
+            .trim_start()
+            .split('[')
+            .skip(1)
+            .map_while(|segment| segment.split_once(']').map(|(value, _)| value.trim()))
+            .filter(|value| !value.is_empty())
+            .collect();
+        let selected = message_segments
+            .iter()
+            .copied()
+            .find(|value| {
+                !CONTEXT_SEGMENTS
+                    .iter()
+                    .any(|context| value.eq_ignore_ascii_case(context))
+            })
+            .or_else(|| message_segments.first().copied());
+
+        selected.map(str::to_string).unwrap_or_else(|| {
+            self.subsystem
+                .split('.')
+                .find(|segment| {
+                    !segment.is_empty()
+                        && !CONTEXT_SEGMENTS
+                            .iter()
+                            .any(|context| segment.eq_ignore_ascii_case(context))
+                })
+                .or_else(|| {
+                    self.subsystem
+                        .split('.')
+                        .find(|segment| !segment.is_empty())
+                })
+                .unwrap_or("Other")
+                .split('_')
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    let mut chars = part.chars();
+                    chars
+                        .next()
+                        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    }
+
     pub fn scalar_field_text(&self, key: &str) -> Option<String> {
         let value = self.fields.get(key)?;
         scalar_text(value)
@@ -327,5 +379,26 @@ mod tests {
         }"#;
         let event: LogEvent = serde_json::from_str(raw).unwrap();
         assert_eq!(event.timestamp_text(), "2026-08-16T12:00:00.000Z");
+    }
+
+    #[test]
+    fn derives_feature_tag_across_sources_and_context_prefixes() {
+        let mut event = LogEvent::new(
+            Level::Debug,
+            "backend",
+            "segment_detection.local",
+            "segment_detection.message",
+            "[Segment Detection][Local] Lookup started",
+            "app-1",
+        );
+        assert_eq!(event.tag(), "Segment Detection");
+
+        event.message = "[Settings][WhisperLive] Runtime test started".to_string();
+        event.subsystem = "settings.whisperlive".to_string();
+        assert_eq!(event.tag(), "WhisperLive");
+
+        event.message = "Cache inventory refreshed".to_string();
+        event.subsystem = "audio_normalizer.storage".to_string();
+        assert_eq!(event.tag(), "Audio Normalizer");
     }
 }

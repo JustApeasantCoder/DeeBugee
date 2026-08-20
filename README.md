@@ -9,11 +9,11 @@ The viewer is built with Rust, `egui`, and `wgpu`. Logs remain on the local mach
 - Follow one or more append-only JSONL files in real time.
 - Open files from the picker, command line, or drag and drop.
 - Search messages and structured fields with fuzzy, multi-term matching.
-- Filter by level, source, subsystem, target, event, provider, status, correlation, and custom scalar fields.
+- Filter by level, source, feature tag, subsystem, target, event, provider, status, correlation, and custom scalar fields.
 - Keep up to 250,000 recent records in a bounded in-memory window.
 - Reorder and resize columns, wrap messages, and inspect complete event details.
 - Save filter bookmarks and reusable TOML workspaces.
-- Color related events by source, subsystem, target, event, provider, or correlation.
+- Color related events by source, feature tag, subsystem, target, event, provider, or correlation.
 - Pause live following, choose whether the newest event appears at the top or bottom, and export filtered results.
 - Preserve layout and viewing preferences automatically between launches.
 - Produce compatible logs with the included Rust, Electron, and .NET adapters.
@@ -77,6 +77,8 @@ Search terms use AND semantics across messages, event names, sources, subsystems
 
 Facet controls provide fast structured filtering:
 
+Feature tags are derived consistently from bracketed message prefixes and subsystem names. Context prefixes such as `Settings`, `Frontend`, `Backend`, `Local`, and `Remote` do not replace the underlying feature, so `[Segment Detection][Local]` and `[Settings][WhisperLive]` remain grouped under `Segment Detection` and `WhisperLive` respectively.
+
 - Left-click a value to include only that value in its facet.
 - Ctrl+left-click additional values to combine them with OR semantics.
 - Right-click a value to exclude it.
@@ -97,7 +99,7 @@ Save frequently used searches and facet combinations as bookmarks from the bar a
 - Pause and resume live following at any time.
 - Place the latest record at the top or bottom of the table.
 
-Manual scrolling pauses automatic following until the latest edge is reached again. Column order, widths, panel sizes, bookmarks, message wrapping, colors, and tail preferences are restored automatically on the next launch.
+Manual vertical scrolling pauses automatic following until the latest edge is reached again. Horizontal scrolling does not interrupt vertical following. Column order, widths, panel sizes, bookmarks, message wrapping, colors, and tail preferences are restored automatically on the next launch.
 
 ### Workspaces and export
 

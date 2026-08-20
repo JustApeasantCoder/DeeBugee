@@ -2,22 +2,31 @@ use std::{
     collections::BTreeMap,
     io::{BufWriter, Write},
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use crossbeam_channel::TryRecvError;
-use dee_bugee_core::{EventStore, FilterState, PRIMARY_FACETS, status_text};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
+use dee_bugee_core::{
+    EventStore, FacetSelection, FilterState, PRIMARY_FACETS, SearchSnapshot, status_text,
+};
 use dee_bugee_schema::{Level, LogEvent};
-use eframe::egui::{self, Color32, Label, PointerButton, RichText, Sense, TextStyle};
+use eframe::egui::{
+    self, Color32, FontFamily, FontId, Label, PointerButton, RichText, Sense, Stroke, TextStyle,
+};
 use egui_extras::{Column, TableBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::follower::{ReaderCommand, ReaderHandle, ReaderMessage, spawn_reader};
 
-const DISPLAYED_FACETS: [&str; 8] = [
+const DISPLAYED_FACETS: [&str; 9] = [
     "level",
     "source",
+    "tag",
     "subsystem",
     "target",
     "event",
@@ -27,6 +36,83 @@ const DISPLAYED_FACETS: [&str; 8] = [
 ];
 const PREFERENCES_KEY: &str = "dee_bugee.viewer_preferences.v1";
 const TAIL_HEADROOM_ROWS: f32 = 6.0;
+const TAIL_SETTLE_FRAMES: u8 = 2;
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
+
+const SURFACE_0: Color32 = Color32::from_rgb(13, 16, 22);
+const SURFACE_1: Color32 = Color32::from_rgb(18, 22, 29);
+const SURFACE_2: Color32 = Color32::from_rgb(25, 30, 39);
+const BORDER: Color32 = Color32::from_rgb(43, 50, 63);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 230, 238);
+const TEXT_MUTED: Color32 = Color32::from_rgb(139, 149, 166);
+const ACCENT: Color32 = Color32::from_rgb(92, 139, 255);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(34, 53, 91);
+const SUCCESS: Color32 = Color32::from_rgb(87, 205, 148);
+const WARNING: Color32 = Color32::from_rgb(240, 184, 82);
+const DANGER: Color32 = Color32::from_rgb(242, 108, 122);
+
+fn configure_ui(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = SURFACE_0;
+    visuals.window_fill = SURFACE_1;
+    visuals.extreme_bg_color = Color32::from_rgb(10, 13, 18);
+    visuals.text_edit_bg_color = Some(Color32::from_rgb(11, 14, 20));
+    visuals.faint_bg_color = Color32::from_rgb(16, 20, 27);
+    visuals.code_bg_color = Color32::from_rgb(11, 14, 19);
+    visuals.override_text_color = Some(TEXT_PRIMARY);
+    visuals.weak_text_color = Some(TEXT_MUTED);
+    visuals.selection.bg_fill = ACCENT_SOFT;
+    visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(177, 197, 255));
+    visuals.warn_fg_color = WARNING;
+    visuals.error_fg_color = DANGER;
+    visuals.window_stroke = Stroke::new(1.0, BORDER);
+    visuals.widgets.noninteractive.bg_fill = SURFACE_1;
+    visuals.widgets.noninteractive.weak_bg_fill = SURFACE_1;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.inactive.bg_fill = SURFACE_2;
+    visuals.widgets.inactive.weak_bg_fill = SURFACE_2;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(35, 42, 54);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(35, 42, 54);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(68, 80, 101));
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.active.bg_fill = ACCENT_SOFT;
+    visuals.widgets.active.weak_bg_fill = ACCENT_SOFT;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.open = visuals.widgets.active;
+
+    ctx.set_visuals(visuals);
+    ctx.all_styles_mut(|style| {
+        style.animation_time = 0.10;
+        style.spacing.item_spacing = egui::vec2(7.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.interact_size = egui::vec2(38.0, 28.0);
+        style.spacing.indent = 16.0;
+        style.text_styles = [
+            (
+                TextStyle::Heading,
+                FontId::new(20.0, FontFamily::Proportional),
+            ),
+            (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
+            (
+                TextStyle::Button,
+                FontId::new(13.0, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Small,
+                FontId::new(11.0, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Monospace,
+                FontId::new(13.0, FontFamily::Monospace),
+            ),
+        ]
+        .into();
+    });
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +120,7 @@ enum TableColumn {
     Timestamp,
     Level,
     Source,
+    Tag,
     Subsystem,
     Event,
     Provider,
@@ -49,6 +136,7 @@ enum ColorBy {
     #[default]
     Off,
     Source,
+    Tag,
     Subsystem,
     Target,
     Event,
@@ -76,9 +164,10 @@ impl LatestAt {
 }
 
 impl ColorBy {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Off,
         Self::Source,
+        Self::Tag,
         Self::Subsystem,
         Self::Target,
         Self::Event,
@@ -90,6 +179,7 @@ impl ColorBy {
         match self {
             Self::Off => "Off",
             Self::Source => "Source",
+            Self::Tag => "Tag",
             Self::Subsystem => "Subsystem",
             Self::Target => "Target",
             Self::Event => "Event",
@@ -98,17 +188,18 @@ impl ColorBy {
         }
     }
 
-    fn event_value(self, event: &LogEvent) -> Option<&str> {
+    fn event_value(self, event: &LogEvent) -> Option<String> {
         match self {
             Self::Off => None,
-            Self::Source => Some(event.source.as_str()),
-            Self::Subsystem => Some(event.subsystem.as_str()),
-            Self::Target => event.target.as_deref(),
-            Self::Event => Some(event.event.as_str()),
-            Self::Provider => event.provider.as_deref(),
-            Self::Correlation => Some(event.correlation_id()),
+            Self::Source => Some(event.source.clone()),
+            Self::Tag => Some(event.tag()),
+            Self::Subsystem => Some(event.subsystem.clone()),
+            Self::Target => event.target.clone(),
+            Self::Event => Some(event.event.clone()),
+            Self::Provider => event.provider.clone(),
+            Self::Correlation => Some(event.correlation_id().to_string()),
         }
-        .filter(|value| !value.is_empty() && *value != "-")
+        .filter(|value| !value.is_empty() && value != "-")
     }
 }
 
@@ -119,10 +210,11 @@ struct FilterBookmark {
 }
 
 impl TableColumn {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Timestamp,
         Self::Level,
         Self::Source,
+        Self::Tag,
         Self::Subsystem,
         Self::Event,
         Self::Provider,
@@ -137,6 +229,7 @@ impl TableColumn {
             Self::Timestamp => "Timestamp",
             Self::Level => "Level",
             Self::Source => "Source",
+            Self::Tag => "Tag",
             Self::Subsystem => "Subsystem",
             Self::Event => "Event",
             Self::Provider => "Provider",
@@ -150,8 +243,9 @@ impl TableColumn {
     fn layout(self) -> Column {
         match self {
             Self::Timestamp => Column::initial(185.0).at_least(140.0),
-            Self::Level => Column::initial(62.0).at_least(54.0),
+            Self::Level => Column::initial(76.0).at_least(70.0),
             Self::Source => Column::initial(90.0).at_least(65.0),
+            Self::Tag => Column::initial(130.0).at_least(85.0),
             Self::Subsystem => Column::initial(110.0).at_least(75.0),
             Self::Event => Column::initial(150.0).at_least(90.0),
             Self::Provider => Column::initial(90.0).at_least(65.0),
@@ -220,6 +314,97 @@ struct WorkspaceConfig {
     column_order: Vec<TableColumn>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchMode {
+    Full,
+    Incremental,
+}
+
+#[derive(Debug)]
+struct SearchRequest {
+    generation: u64,
+    query: String,
+    snapshot: SearchSnapshot,
+    mode: SearchMode,
+    start_index: usize,
+    event_count: usize,
+    discarded_events: u64,
+}
+
+#[derive(Debug)]
+struct SearchResponse {
+    generation: u64,
+    query: String,
+    matches: Vec<usize>,
+    mode: SearchMode,
+    start_index: usize,
+    event_count: usize,
+    discarded_events: u64,
+}
+
+struct SearchWorker {
+    requests: Sender<SearchRequest>,
+    responses: Receiver<SearchResponse>,
+    latest_generation: Arc<AtomicU64>,
+}
+
+impl SearchWorker {
+    fn spawn(ctx: egui::Context) -> Self {
+        let (request_sender, request_receiver) = unbounded::<SearchRequest>();
+        let (response_sender, response_receiver) = unbounded();
+        let latest_generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = Arc::clone(&latest_generation);
+        thread::Builder::new()
+            .name("debug-log-search".to_string())
+            .spawn(move || {
+                while let Ok(mut request) = request_receiver.recv() {
+                    for newer in request_receiver.try_iter() {
+                        request = newer;
+                    }
+                    if worker_generation.load(Ordering::Acquire) != request.generation {
+                        continue;
+                    }
+                    let generation = request.generation;
+                    let Some(matches) = request.snapshot.search(&request.query, || {
+                        worker_generation.load(Ordering::Relaxed) != generation
+                    }) else {
+                        continue;
+                    };
+                    if worker_generation.load(Ordering::Acquire) != generation {
+                        continue;
+                    }
+                    let response = SearchResponse {
+                        generation,
+                        query: request.query,
+                        matches,
+                        mode: request.mode,
+                        start_index: request.start_index,
+                        event_count: request.event_count,
+                        discarded_events: request.discarded_events,
+                    };
+                    if response_sender.send(response).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
+            })
+            .expect("failed to start log search worker");
+        Self {
+            requests: request_sender,
+            responses: response_receiver,
+            latest_generation,
+        }
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.latest_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn send(&self, request: SearchRequest) -> bool {
+        self.requests.send(request).is_ok()
+    }
+}
+
 pub struct ViewerApp {
     store: EventStore,
     filter: FilterState,
@@ -242,7 +427,16 @@ pub struct ViewerApp {
     middle_pan_active: bool,
     tail_was_at_bottom: bool,
     scroll_to_bottom_requested: bool,
+    scroll_settle_frames: u8,
     last_discarded_events: u64,
+    search_worker: SearchWorker,
+    search_generation: u64,
+    search_due_at: Option<Instant>,
+    search_in_flight: bool,
+    text_matches: Vec<usize>,
+    text_matches_query: String,
+    text_matches_event_count: usize,
+    text_matches_discarded_events: u64,
 }
 
 impl ViewerApp {
@@ -250,10 +444,7 @@ impl ViewerApp {
         creation_context: &eframe::CreationContext<'_>,
         initial_paths: Vec<PathBuf>,
     ) -> Self {
-        creation_context.egui_ctx.set_visuals(egui::Visuals::dark());
-        creation_context
-            .egui_ctx
-            .global_style_mut(|style| style.animation_time = 0.08);
+        configure_ui(&creation_context.egui_ctx);
 
         let mut preferences = creation_context
             .storage
@@ -263,6 +454,7 @@ impl ViewerApp {
         preferences.column_order = normalize_column_order(preferences.column_order);
 
         let reader = spawn_reader(initial_paths);
+        let search_worker = SearchWorker::spawn(creation_context.egui_ctx.clone());
         let mut app = Self {
             store: EventStore::default(),
             filter: FilterState::default(),
@@ -285,7 +477,16 @@ impl ViewerApp {
             middle_pan_active: false,
             tail_was_at_bottom: true,
             scroll_to_bottom_requested: true,
+            scroll_settle_frames: TAIL_SETTLE_FRAMES,
             last_discarded_events: 0,
+            search_worker,
+            search_generation: 0,
+            search_due_at: None,
+            search_in_flight: false,
+            text_matches: Vec::new(),
+            text_matches_query: String::new(),
+            text_matches_event_count: 0,
+            text_matches_discarded_events: 0,
         };
         app.refresh_filters();
         app
@@ -324,19 +525,48 @@ impl ViewerApp {
             self.last_discarded_events = self.store.discarded_events();
             self.selected_row = None;
             received_events = true;
+            if !self.filter.text.trim().is_empty() && !self.paused {
+                self.schedule_text_search(Duration::ZERO);
+            }
         }
         if received_events && !self.paused {
             self.filters_dirty = true;
-            if self.stick_to_bottom && self.tail_was_at_bottom {
-                self.scroll_to_bottom_requested = true;
+            if self.stick_to_bottom && (self.tail_was_at_bottom || self.scroll_to_bottom_requested)
+            {
+                self.request_scroll_to_latest();
             }
         }
     }
 
-    fn refresh_filters(&mut self) {
-        self.visible_rows = self.store.query(&self.filter);
-        order_visible_rows(&mut self.visible_rows, self.latest_at);
-        self.facet_counts.clear();
+    fn request_scroll_to_latest(&mut self) {
+        self.scroll_to_bottom_requested = true;
+        self.scroll_settle_frames = TAIL_SETTLE_FRAMES;
+    }
+
+    fn filter_changed(&mut self) {
+        self.filters_dirty = true;
+        self.tail_was_at_bottom = true;
+        self.request_scroll_to_latest();
+    }
+
+    fn jump_to_latest_button(&mut self, ui: &mut egui::Ui) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let label = match self.latest_at {
+                LatestAt::Top => "↑ Jump To latest",
+                LatestAt::Bottom => "↓ Jump To latest",
+            };
+            if ui
+                .button(label)
+                .on_hover_text("Jump to the newest matching event")
+                .clicked()
+            {
+                self.tail_was_at_bottom = true;
+                self.request_scroll_to_latest();
+            }
+        });
+    }
+
+    fn displayed_facets(&self) -> Vec<String> {
         let mut facets: Vec<String> = DISPLAYED_FACETS
             .iter()
             .map(|facet| facet.to_string())
@@ -348,11 +578,111 @@ impl ViewerApp {
                 .take(20)
                 .map(str::to_string),
         );
-        for facet in facets {
-            self.facet_counts
-                .insert(facet.clone(), self.store.facet_counts(&facet, &self.filter));
-        }
+        facets
+    }
+
+    fn refresh_filters(&mut self) {
+        let facets = self.displayed_facets();
+        let text_matches =
+            (!self.filter.text.trim().is_empty()).then_some(self.text_matches.as_slice());
+        let results = self
+            .store
+            .query_with_facets(&self.filter, &facets, text_matches);
+        self.visible_rows = results.rows;
+        order_visible_rows(&mut self.visible_rows, self.latest_at);
+        self.facet_counts = results.facet_counts;
         self.filters_dirty = false;
+    }
+
+    fn cached_search_is_current(&self) -> bool {
+        self.text_matches_query == self.filter.text
+            && self.text_matches_discarded_events == self.store.discarded_events()
+    }
+
+    fn schedule_text_search(&mut self, delay: Duration) {
+        self.search_generation = self.search_worker.next_generation();
+        self.search_due_at = Some(Instant::now() + delay);
+        self.search_in_flight = false;
+    }
+
+    fn start_scheduled_search(&mut self) {
+        let Some(due_at) = self.search_due_at else {
+            return;
+        };
+        if Instant::now() < due_at || self.paused {
+            return;
+        }
+        self.search_due_at = None;
+        let query = self.filter.text.clone();
+        if query.trim().is_empty() {
+            self.text_matches.clear();
+            self.text_matches_query.clear();
+            self.text_matches_event_count = self.store.len();
+            self.text_matches_discarded_events = self.store.discarded_events();
+            self.filters_dirty = true;
+            return;
+        }
+
+        let can_extend =
+            self.cached_search_is_current() && self.text_matches_event_count <= self.store.len();
+        let (mode, start_index) = if can_extend {
+            (SearchMode::Incremental, self.text_matches_event_count)
+        } else {
+            (SearchMode::Full, 0)
+        };
+        if mode == SearchMode::Incremental && start_index == self.store.len() {
+            self.filters_dirty = true;
+            return;
+        }
+        let event_count = self.store.len();
+        let request = SearchRequest {
+            generation: self.search_generation,
+            query,
+            snapshot: self.store.search_snapshot(start_index),
+            mode,
+            start_index,
+            event_count,
+            discarded_events: self.store.discarded_events(),
+        };
+        self.search_in_flight = self.search_worker.send(request);
+        if !self.search_in_flight {
+            self.last_error = Some("Log search worker is unavailable".to_string());
+        }
+    }
+
+    fn drain_search_results(&mut self) {
+        while let Ok(response) = self.search_worker.responses.try_recv() {
+            if response.generation != self.search_generation {
+                continue;
+            }
+            self.search_in_flight = false;
+            if response.query != self.filter.text
+                || response.discarded_events != self.store.discarded_events()
+            {
+                self.schedule_text_search(Duration::ZERO);
+                continue;
+            }
+            match response.mode {
+                SearchMode::Full => self.text_matches = response.matches,
+                SearchMode::Incremental
+                    if self.cached_search_is_current()
+                        && self.text_matches_event_count == response.start_index =>
+                {
+                    self.text_matches.extend(response.matches);
+                }
+                SearchMode::Incremental => {
+                    self.schedule_text_search(Duration::ZERO);
+                    continue;
+                }
+            }
+            self.text_matches_query = response.query;
+            self.text_matches_event_count = response.event_count;
+            self.text_matches_discarded_events = response.discarded_events;
+            self.filters_dirty = true;
+            if response.event_count < self.store.len() {
+                self.schedule_text_search(Duration::ZERO);
+            }
+        }
     }
 
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
@@ -468,176 +798,265 @@ impl ViewerApp {
     }
 
     fn top_bar(&mut self, root: &mut egui::Ui) {
-        egui::Panel::top("toolbar").show(root, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Open JSONL…").clicked()
-                    && let Some(paths) = rfd::FileDialog::new()
-                        .add_filter("JSON Lines", &["jsonl", "log"])
-                        .pick_files()
-                {
-                    self.add_paths(paths);
-                }
-                if ui.button("Open log folder…").clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_folder()
-                {
-                    self.add_paths(vec![path]);
-                }
-                if ui.button("Open workspace…").clicked() {
-                    self.open_workspace();
-                }
-                if ui.button("Save workspace…").clicked() {
-                    self.save_workspace();
-                }
-                if ui
-                    .add_enabled(
-                        !self.visible_rows.is_empty(),
-                        egui::Button::new("Export filtered…"),
-                    )
-                    .clicked()
-                {
-                    self.export_filtered();
-                }
-
-                if ui
-                    .selectable_label(self.paused, if self.paused { "Resume" } else { "Pause" })
-                    .on_hover_text(
-                        "Pause freezes the current view; ingestion continues in the background",
-                    )
-                    .clicked()
-                {
-                    self.paused = !self.paused;
-                    if !self.paused {
-                        self.filters_dirty = true;
+        let toolbar_frame = egui::Frame::new()
+            .fill(SURFACE_1)
+            .inner_margin(egui::Margin::symmetric(14, 9))
+            .stroke(Stroke::new(1.0, BORDER));
+        egui::Panel::top("toolbar")
+            .frame(toolbar_frame)
+            .show(root, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Open logs").clicked()
+                        && let Some(paths) = rfd::FileDialog::new()
+                            .add_filter("JSON Lines", &["jsonl", "log"])
+                            .pick_files()
+                    {
+                        self.add_paths(paths);
                     }
-                }
-                if ui
-                    .checkbox(&mut self.stick_to_bottom, "Stick to latest")
-                    .changed()
-                    && self.stick_to_bottom
-                {
-                    self.tail_was_at_bottom = true;
-                    self.scroll_to_bottom_requested = true;
-                }
-                let previous_latest_at = self.latest_at;
-                egui::ComboBox::from_id_salt("latest_at")
-                    .selected_text(format!("Latest at: {}", self.latest_at.title()))
-                    .show_ui(ui, |ui| {
-                        for option in LatestAt::ALL {
-                            ui.selectable_value(&mut self.latest_at, option, option.title());
+                    if ui.button("Open folder").clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.add_paths(vec![path]);
+                    }
+                    ui.menu_button("Workspace", |ui| {
+                        if ui.button("Open workspace…").clicked() {
+                            self.open_workspace();
+                            ui.close();
                         }
-                    });
-                if self.latest_at != previous_latest_at {
-                    self.filters_dirty = true;
-                    self.tail_was_at_bottom = true;
-                    self.scroll_to_bottom_requested = true;
-                }
-                ui.checkbox(&mut self.wrapped_messages, "Wrap messages");
-                egui::ComboBox::from_id_salt("color_by")
-                    .selected_text(format!("Color by: {}", self.color_by.title()))
-                    .show_ui(ui, |ui| {
-                        for option in ColorBy::ALL {
-                            ui.selectable_value(&mut self.color_by, option, option.title());
+                        if ui.button("Save workspace as…").clicked() {
+                            self.save_workspace();
+                            ui.close();
                         }
-                    });
-                ui.label(RichText::new("↔ Drag headers · Middle-drag to pan table").weak());
-
-                ui.separator();
-                ui.label("Search");
-                if ui
-                    .add_sized(
-                        [280.0, 24.0],
-                        egui::TextEdit::singleline(&mut self.filter.text)
-                            .hint_text("message, event, subsystem or field"),
-                    )
-                    .changed()
-                {
-                    self.filters_dirty = true;
-                    self.tail_was_at_bottom = true;
-                    self.scroll_to_bottom_requested = true;
-                }
-
-                egui::ComboBox::from_id_salt("minimum_level")
-                    .selected_text(
-                        self.filter
-                            .minimum_level
-                            .map(|level| format!("≥ {level}"))
-                            .unwrap_or_else(|| "All levels".to_string()),
-                    )
-                    .show_ui(ui, |ui| {
+                        ui.separator();
                         if ui
-                            .selectable_value(&mut self.filter.minimum_level, None, "All levels")
-                            .changed()
+                            .add_enabled(
+                                !self.visible_rows.is_empty(),
+                                egui::Button::new("Export filtered logs…"),
+                            )
+                            .clicked()
                         {
-                            self.filters_dirty = true;
+                            self.export_filtered();
+                            ui.close();
                         }
-                        for level in Level::ALL {
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let total = self.store.len();
+                        let shown = self.visible_rows.len();
+                        ui.label(
+                            RichText::new(format!("{shown} shown  ·  {total} loaded"))
+                                .color(TEXT_MUTED),
+                        );
+                        if self.paused {
+                            ui.label(RichText::new("PAUSED").strong().small().color(WARNING));
+                        } else if total > 0 {
+                            ui.label(RichText::new("LIVE").strong().small().color(SUCCESS));
+                        }
+                    });
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    let search_width = (ui.available_width() * 0.34).clamp(260.0, 520.0);
+                    let search = ui.add_sized(
+                        [search_width, 30.0],
+                        egui::TextEdit::singleline(&mut self.filter.text)
+                            .hint_text("Search messages, events, subsystems, or fields…"),
+                    );
+                    if search.changed() {
+                        self.schedule_text_search(SEARCH_DEBOUNCE);
+                        self.tail_was_at_bottom = true;
+                        self.request_scroll_to_latest();
+                    }
+                    if self.search_due_at.is_some() || self.search_in_flight {
+                        ui.spinner();
+                        ui.label(RichText::new("Searching…").small().color(TEXT_MUTED));
+                    }
+
+                    egui::ComboBox::from_id_salt("minimum_level")
+                        .selected_text(
+                            self.filter
+                                .minimum_level
+                                .map(|level| format!("{level} +"))
+                                .unwrap_or_else(|| "All levels".to_string()),
+                        )
+                        .width(96.0)
+                        .show_ui(ui, |ui| {
                             if ui
                                 .selectable_value(
                                     &mut self.filter.minimum_level,
-                                    Some(level),
-                                    format!("≥ {level}"),
+                                    None,
+                                    "All levels",
                                 )
                                 .changed()
                             {
-                                self.filters_dirty = true;
+                                self.filter_changed();
                             }
+                            for level in Level::ALL {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.filter.minimum_level,
+                                        Some(level),
+                                        format!("{level} +"),
+                                    )
+                                    .changed()
+                                {
+                                    self.filter_changed();
+                                }
+                            }
+                        });
+
+                    if ui
+                        .add_enabled(self.filter.is_active(), egui::Button::new("Clear"))
+                        .on_hover_text("Clear all search and facet filters")
+                        .clicked()
+                    {
+                        self.filter.clear();
+                        self.filter_changed();
+                    }
+
+                    ui.separator();
+                    if ui
+                        .add(
+                            egui::Button::new(if self.paused { "Resume" } else { "Pause" })
+                                .selected(self.paused),
+                        )
+                        .on_hover_text(
+                            "Pause freezes the current view; ingestion continues in the background",
+                        )
+                        .clicked()
+                    {
+                        self.paused = !self.paused;
+                        if !self.paused {
+                            self.filters_dirty = true;
+                        }
+                    }
+                    if ui
+                        .checkbox(&mut self.stick_to_bottom, "Follow latest")
+                        .changed()
+                        && self.stick_to_bottom
+                    {
+                        self.tail_was_at_bottom = true;
+                        self.request_scroll_to_latest();
+                    }
+                    let previous_latest_at = self.latest_at;
+                    egui::ComboBox::from_id_salt("latest_at")
+                        .selected_text(format!("Latest: {}", self.latest_at.title()))
+                        .show_ui(ui, |ui| {
+                            for option in LatestAt::ALL {
+                                ui.selectable_value(&mut self.latest_at, option, option.title());
+                            }
+                        });
+                    if self.latest_at != previous_latest_at {
+                        self.filter_changed();
+                    }
+                    ui.checkbox(&mut self.wrapped_messages, "Wrap");
+                    egui::ComboBox::from_id_salt("color_by")
+                        .selected_text(format!("Color: {}", self.color_by.title()))
+                        .show_ui(ui, |ui| {
+                            for option in ColorBy::ALL {
+                                ui.selectable_value(&mut self.color_by, option, option.title());
+                            }
+                        });
+                });
+
+                if let Some(error) = self.last_error.clone() {
+                    ui.add_space(5.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(56, 27, 34))
+                        .inner_margin(egui::Margin::symmetric(9, 5))
+                        .corner_radius(4.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Error").strong().color(DANGER));
+                                ui.label(&error);
+                                if ui.small_button("Dismiss").clicked() {
+                                    self.last_error = None;
+                                }
+                            });
+                        });
+                } else if self.invalid_records > 0 || self.store.discarded_events() > 0 {
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        if self.invalid_records > 0 {
+                            ui.label(
+                                RichText::new(format!("{} invalid records", self.invalid_records))
+                                    .color(WARNING),
+                            );
+                        }
+                        if self.store.discarded_events() > 0 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} outside memory window",
+                                    self.store.discarded_events()
+                                ))
+                                .color(WARNING),
+                            );
                         }
                     });
-
-                if ui
-                    .add_enabled(self.filter.is_active(), egui::Button::new("Clear filters"))
-                    .clicked()
-                {
-                    self.filter.clear();
-                    self.filters_dirty = true;
-                    self.tail_was_at_bottom = true;
-                    self.scroll_to_bottom_requested = true;
                 }
-
-                ui.separator();
-                ui.label(format!(
-                    "{} shown / {} loaded",
-                    self.visible_rows.len(),
-                    self.store.len()
-                ));
-                if self.invalid_records > 0 {
-                    ui.colored_label(Color32::YELLOW, format!("{} invalid", self.invalid_records));
-                }
-                if self.store.discarded_events() > 0 {
-                    ui.colored_label(
-                        Color32::YELLOW,
-                        format!("{} outside memory window", self.store.discarded_events()),
-                    );
+                if let Some(notice) = self.last_notice.clone() {
+                    ui.add_space(5.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(23, 50, 42))
+                        .inner_margin(egui::Margin::symmetric(9, 5))
+                        .corner_radius(4.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Done").strong().color(SUCCESS));
+                                ui.label(&notice);
+                                if ui.small_button("Dismiss").clicked() {
+                                    self.last_notice = None;
+                                }
+                            });
+                        });
                 }
             });
-
-            if let Some(error) = self.last_error.clone() {
-                ui.horizontal(|ui| {
-                    ui.colored_label(Color32::LIGHT_RED, &error);
-                    if ui.small_button("Dismiss").clicked() {
-                        self.last_error = None;
-                    }
-                });
-            }
-            if let Some(notice) = self.last_notice.clone() {
-                ui.horizontal(|ui| {
-                    ui.colored_label(Color32::LIGHT_GREEN, &notice);
-                    if ui.small_button("Dismiss").clicked() {
-                        self.last_notice = None;
-                    }
-                });
-            }
-        });
     }
 
     fn sidebar(&mut self, root: &mut egui::Ui) {
+        let active_filter_count = usize::from(!self.filter.text.trim().is_empty())
+            + usize::from(self.filter.minimum_level.is_some())
+            + usize::from(self.filter.correlation.is_some())
+            + self
+                .filter
+                .facets
+                .values()
+                .filter(|selection| !selection.is_empty())
+                .count();
         egui::Panel::left("facets")
-            .default_size(260.0)
-            .min_size(180.0)
+            .default_size(248.0)
+            .min_size(200.0)
             .resizable(true)
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE_1)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
             .show(root, |ui| {
-                ui.heading("Filters");
-                ui.small("Left-click: only · Ctrl+click: add · Right-click: hide");
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.spacing_mut().interact_size.y = 22.0;
+
+                ui.horizontal(|ui| {
+                    ui.heading("Filters");
+                    if active_filter_count > 0 {
+                        ui.label(
+                            RichText::new(active_filter_count.to_string())
+                                .strong()
+                                .color(ACCENT),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(active_filter_count > 0, egui::Button::new("Reset"))
+                            .clicked()
+                        {
+                            self.filter.clear();
+                            self.filter_changed();
+                        }
+                    });
+                });
                 ui.separator();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -649,9 +1068,7 @@ impl ViewerApp {
                             .get(facet)
                             .is_some_and(|selection| !selection.is_empty());
                         let title = if active {
-                            RichText::new(facet_title(facet))
-                                .strong()
-                                .color(Color32::LIGHT_BLUE)
+                            RichText::new(facet_title(facet)).strong().color(ACCENT)
                         } else {
                             RichText::new(facet_title(facet)).strong()
                         };
@@ -698,13 +1115,15 @@ impl ViewerApp {
         let state = self.filter.facets.get(facet);
         let included = state.is_some_and(|selection| selection.included.contains(value));
         let excluded = state.is_some_and(|selection| selection.excluded.contains(value));
-        let label = format!("{value}    {count}");
+        let label = format!("{value}   {count}");
         let text = if excluded {
+            RichText::new(label).color(DANGER).strikethrough()
+        } else if included {
             RichText::new(label)
-                .color(Color32::LIGHT_RED)
-                .strikethrough()
+                .strong()
+                .color(Color32::from_rgb(190, 207, 255))
         } else {
-            RichText::new(label)
+            RichText::new(label).color(TEXT_PRIMARY)
         };
         let response = ui
             .selectable_label(included, text)
@@ -712,18 +1131,8 @@ impl ViewerApp {
 
         if response.clicked_by(PointerButton::Primary) {
             let selection = self.filter.facets.entry(facet.to_string()).or_default();
-            if ui.input(|input| input.modifiers.ctrl) {
-                selection.toggle_include(value);
-            } else if selection.included.len() == 1
-                && selection.included.contains(value)
-                && selection.excluded.is_empty()
-            {
-                selection.included.clear();
-            } else {
-                selection.excluded.remove(value);
-                selection.include_only(value);
-            }
-            self.filters_dirty = true;
+            apply_primary_facet_click(selection, value, ui.input(|input| input.modifiers.ctrl));
+            self.filter_changed();
         }
         if response.clicked_by(PointerButton::Secondary) {
             self.filter
@@ -731,7 +1140,7 @@ impl ViewerApp {
                 .entry(facet.to_string())
                 .or_default()
                 .toggle_exclude(value);
-            self.filters_dirty = true;
+            self.filter_changed();
         }
     }
 
@@ -749,11 +1158,16 @@ impl ViewerApp {
         let mut remove_index = None;
 
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Bookmarks").strong());
+            ui.label(
+                RichText::new("SAVED VIEWS")
+                    .strong()
+                    .small()
+                    .color(TEXT_MUTED),
+            );
             if ui
                 .add_enabled(
                     self.filter.is_active() && !already_saved,
-                    egui::Button::new("＋ Add bookmark"),
+                    egui::Button::new("＋ Save current"),
                 )
                 .on_hover_text("Save the current search and facet filters")
                 .clicked()
@@ -766,10 +1180,7 @@ impl ViewerApp {
 
             for (index, bookmark) in bookmarks.iter().enumerate() {
                 let response = ui
-                    .selectable_label(
-                        bookmark.filter == self.filter,
-                        format!("★ {}", bookmark.name),
-                    )
+                    .selectable_label(bookmark.filter == self.filter, bookmark.name.clone())
                     .on_hover_text("Click to apply; right-click to remove");
                 if response.clicked() {
                     apply_filter = Some(bookmark.filter.clone());
@@ -783,9 +1194,7 @@ impl ViewerApp {
 
         if let Some(filter) = apply_filter {
             self.filter = filter;
-            self.filters_dirty = true;
-            self.tail_was_at_bottom = true;
-            self.scroll_to_bottom_requested = true;
+            self.filter_changed();
         }
         if let Some(index) = remove_index {
             self.bookmarks.remove(index);
@@ -803,26 +1212,46 @@ impl ViewerApp {
 
         egui::Panel::bottom("details")
             .resizable(true)
-            .default_size(190.0)
-            .min_size(100.0)
+            .default_size(220.0)
+            .min_size(120.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE_1)
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Selected event");
-                    if ui.button("Filter correlation").clicked() {
+                    ui.heading("Event details");
+                    ui.label(
+                        RichText::new(event.level.to_string().to_uppercase())
+                            .strong()
+                            .small()
+                            .color(level_color(event.level)),
+                    );
+                    ui.label(
+                        RichText::new(event.timestamp_text())
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                    if ui.button("Filter by correlation").clicked() {
                         self.filter.correlation = Some(event.correlation_id().to_string());
-                        self.filters_dirty = true;
+                        self.filter_changed();
                     }
                     if self.filter.correlation.is_some() && ui.button("Clear correlation").clicked()
                     {
                         self.filter.correlation = None;
-                        self.filters_dirty = true;
+                        self.filter_changed();
                     }
-                    if ui.button("Close").clicked() {
-                        self.selected_row = None;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("× Close").clicked() {
+                            self.selected_row = None;
+                        }
+                    });
                 });
+                ui.add_space(4.0);
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.label(RichText::new(&event.message).strong());
+                    ui.label(RichText::new(&event.message).strong().size(15.0));
                     ui.separator();
                     let mut raw = serde_json::to_string_pretty(&event)
                         .unwrap_or_else(|error| format!("Unable to serialize event: {error}"));
@@ -841,8 +1270,21 @@ impl ViewerApp {
             if self.store.is_empty() {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
-                        ui.heading("Open or drop one or more JSONL files");
-                        ui.label("The viewer follows appended records automatically.");
+                        ui.label(RichText::new("{  }").monospace().size(34.0).color(ACCENT));
+                        ui.add_space(10.0);
+                        ui.heading("Open logs to start exploring");
+                        ui.label(
+                            RichText::new(
+                                "Choose JSONL files, open a folder, or drop files anywhere in this window.",
+                            )
+                            .color(TEXT_MUTED),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("New records are followed automatically.")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
                     });
                 });
                 return;
@@ -850,9 +1292,13 @@ impl ViewerApp {
 
             self.bookmark_bar(ui);
 
+            if self.latest_at == LatestAt::Top {
+                self.jump_to_latest_button(ui);
+            }
+
             let row_height = ui.text_style_height(&TextStyle::Body) + 8.0;
             let manual_wheel_scroll = ui.rect_contains_pointer(ui.max_rect())
-                && ui.input(|input| input.smooth_scroll_delta() != egui::Vec2::ZERO);
+                && ui.input(|input| input.smooth_scroll_delta.y.abs() > f32::EPSILON);
             let column_order = self.column_order.clone();
             let visible_rows = &self.visible_rows;
             let store = &self.store;
@@ -864,10 +1310,16 @@ impl ViewerApp {
             let mut selected = self.selected_row;
             let mut requested_move = None;
             let table_content_width = ui.available_width().max(1_400.0);
+            let table_height = if latest_at == LatestAt::Bottom {
+                (ui.available_height() - 30.0).max(0.0)
+            } else {
+                ui.available_height()
+            };
             let mut horizontal_output = egui::ScrollArea::horizontal()
                 .id_salt("events_horizontal_scroll")
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .auto_shrink([false, false])
+                .max_height(table_height)
                 .show(ui, |ui| {
                     ui.set_min_width(table_content_width);
                     let mut table = TableBuilder::new(ui)
@@ -889,9 +1341,10 @@ impl ViewerApp {
                     }
 
                     table
-                        .header(row_height, |mut header| {
+                        .header(row_height + 4.0, |mut header| {
                             for column in &column_order {
                                 header.col(|ui| {
+                                    ui.painter().rect_filled(ui.max_rect(), 0.0, SURFACE_2);
                                     let (drop_zone, dropped) = ui.dnd_drop_zone::<TableColumn, _>(
                                         egui::Frame::NONE,
                                         |ui| {
@@ -905,11 +1358,9 @@ impl ViewerApp {
                                                     ui.add_sized(
                                                         ui.available_size(),
                                                         Label::new(
-                                                            RichText::new(format!(
-                                                                "↔ {}",
-                                                                column.title()
-                                                            ))
-                                                            .strong(),
+                                                            RichText::new(column.title())
+                                                            .strong()
+                                                            .color(Color32::from_rgb(190, 198, 211)),
                                                         ),
                                                     )
                                                 },
@@ -1007,7 +1458,10 @@ impl ViewerApp {
                                 let Some(event) = store.get(store_index) else {
                                     return;
                                 };
-                                let row_color = color_by.event_value(event).map(stable_value_color);
+                                let row_color = color_by
+                                    .event_value(event)
+                                    .as_deref()
+                                    .map(stable_value_color);
                                 row.set_selected(selected == Some(store_index));
                                 for column in &column_order {
                                     row.col(|ui| {
@@ -1068,7 +1522,8 @@ impl ViewerApp {
             }
 
             let vertical_output = &horizontal_output.inner;
-            let manually_scrolled = manual_wheel_scroll || middle_panned;
+            let manually_scrolled =
+                manual_wheel_scroll || (middle_panned && pointer_delta.y.abs() > f32::EPSILON);
             self.tail_was_at_bottom = scroll_is_at_latest(
                 vertical_output.state.offset.y,
                 vertical_output.content_size.y,
@@ -1084,10 +1539,11 @@ impl ViewerApp {
             // request alive until the following frame observes that the viewport
             // really reached the end; otherwise a busy stream can disable tailing
             // between issuing the command and egui applying it.
-            self.scroll_to_bottom_requested = retain_scroll_to_bottom_request(
+            (self.scroll_to_bottom_requested, self.scroll_settle_frames) = advance_scroll_request(
                 scroll_to_bottom_requested,
                 self.tail_was_at_bottom,
                 manually_scrolled,
+                self.scroll_settle_frames,
             );
             if self.scroll_to_bottom_requested {
                 ui.ctx().request_repaint();
@@ -1097,20 +1553,47 @@ impl ViewerApp {
             if let Some((source, target, insert_after)) = requested_move {
                 move_column(&mut self.column_order, source, target, insert_after);
             }
+
+            if latest_at == LatestAt::Bottom {
+                self.jump_to_latest_button(ui);
+            }
         });
+    }
+}
+
+fn apply_primary_facet_click(selection: &mut FacetSelection, value: &str, additive: bool) {
+    if additive {
+        selection.toggle_include(value);
+    } else if selection.included.len() == 1 && selection.included.contains(value) {
+        selection.included.clear();
+    } else {
+        selection.excluded.remove(value);
+        selection.include_only(value);
     }
 }
 
 fn show_event_cell(ui: &mut egui::Ui, column: TableColumn, event: &LogEvent, wrapped: bool) {
     match column {
         TableColumn::Timestamp => {
-            ui.label(event.timestamp_text());
+            ui.label(
+                RichText::new(event.timestamp_text())
+                    .monospace()
+                    .color(TEXT_MUTED),
+            );
         }
         TableColumn::Level => {
-            ui.colored_label(level_color(event.level), event.level.to_string());
+            ui.label(
+                RichText::new(event.level.to_string().to_uppercase())
+                    .strong()
+                    .small()
+                    .color(level_color(event.level)),
+            );
         }
         TableColumn::Source => {
             ui.label(&event.source);
+        }
+        TableColumn::Tag => {
+            ui.label(event.tag());
         }
         TableColumn::Subsystem => {
             ui.label(&event.subsystem);
@@ -1119,21 +1602,21 @@ fn show_event_cell(ui: &mut egui::Ui, column: TableColumn, event: &LogEvent, wra
             ui.label(&event.event);
         }
         TableColumn::Provider => {
-            ui.label(event.provider.as_deref().unwrap_or("-"));
+            optional_cell(ui, event.provider.as_deref());
         }
         TableColumn::Correlation => {
             ui.label(event.correlation_id());
         }
         TableColumn::Duration => {
-            ui.label(
-                event
-                    .duration_ms
-                    .map(|value| format!("{value:.1} ms"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
+            if let Some(value) = event.duration_ms {
+                ui.label(format!("{value:.1} ms"));
+            } else {
+                optional_cell(ui, None);
+            }
         }
         TableColumn::Status => {
-            ui.label(status_text(event.status.as_ref()));
+            let status = status_text(event.status.as_ref());
+            optional_cell(ui, (status != "-").then_some(status.as_str()));
         }
         TableColumn::Message => {
             let label = Label::new(&event.message);
@@ -1143,6 +1626,14 @@ fn show_event_cell(ui: &mut egui::Ui, column: TableColumn, event: &LogEvent, wra
                 label.truncate()
             });
         }
+    }
+}
+
+fn optional_cell(ui: &mut egui::Ui, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        ui.label(value);
+    } else {
+        ui.label(RichText::new("—").color(Color32::from_rgb(78, 87, 102)));
     }
 }
 
@@ -1208,17 +1699,26 @@ fn order_visible_rows(rows: &mut [usize], latest_at: LatestAt) {
     }
 }
 
-fn retain_scroll_to_bottom_request(
+fn advance_scroll_request(
     requested: bool,
     reached_bottom: bool,
     manually_scrolled: bool,
-) -> bool {
-    requested && !reached_bottom && !manually_scrolled
+    settle_frames: u8,
+) -> (bool, u8) {
+    if !requested || manually_scrolled {
+        return (false, 0);
+    }
+    if !reached_bottom {
+        return (true, TAIL_SETTLE_FRAMES);
+    }
+    let remaining = settle_frames.saturating_sub(1);
+    (remaining > 0, remaining)
 }
 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_reader();
+        self.drain_search_results();
 
         let dropped_paths: Vec<PathBuf> = ui.input(|input| {
             input
@@ -1230,8 +1730,29 @@ impl eframe::App for ViewerApp {
         });
         self.add_paths(dropped_paths);
 
-        if self.filters_dirty && !self.paused {
-            self.refresh_filters();
+        if !self.paused {
+            if self.filter.text.trim().is_empty() {
+                if self.search_due_at.take().is_some() || self.search_in_flight {
+                    self.search_generation = self.search_worker.next_generation();
+                    self.search_in_flight = false;
+                }
+                if self.filters_dirty {
+                    self.refresh_filters();
+                }
+            } else if self.cached_search_is_current() {
+                if self.filters_dirty {
+                    self.refresh_filters();
+                }
+                if self.text_matches_event_count < self.store.len()
+                    && self.search_due_at.is_none()
+                    && !self.search_in_flight
+                {
+                    self.schedule_text_search(Duration::ZERO);
+                }
+            } else if self.search_due_at.is_none() && !self.search_in_flight {
+                self.schedule_text_search(Duration::ZERO);
+            }
+            self.start_scheduled_search();
         }
 
         self.top_bar(ui);
@@ -1334,12 +1855,12 @@ fn stable_value_color(value: &str) -> Color32 {
 
 fn level_color(level: Level) -> Color32 {
     match level {
-        Level::Trace => Color32::GRAY,
-        Level::Debug => Color32::LIGHT_GRAY,
-        Level::Info => Color32::LIGHT_BLUE,
-        Level::Warn => Color32::YELLOW,
-        Level::Error => Color32::LIGHT_RED,
-        Level::Fatal => Color32::RED,
+        Level::Trace => Color32::from_rgb(113, 124, 143),
+        Level::Debug => Color32::from_rgb(154, 165, 184),
+        Level::Info => Color32::from_rgb(100, 179, 255),
+        Level::Warn => WARNING,
+        Level::Error => DANGER,
+        Level::Fatal => Color32::from_rgb(255, 73, 103),
     }
 }
 
@@ -1438,10 +1959,19 @@ mod tests {
 
     #[test]
     fn tail_request_survives_until_the_new_offset_reaches_bottom() {
-        assert!(retain_scroll_to_bottom_request(true, false, false));
-        assert!(!retain_scroll_to_bottom_request(true, true, false));
-        assert!(!retain_scroll_to_bottom_request(false, false, false));
-        assert!(!retain_scroll_to_bottom_request(true, false, true));
+        assert_eq!(
+            advance_scroll_request(true, false, false, TAIL_SETTLE_FRAMES),
+            (true, TAIL_SETTLE_FRAMES)
+        );
+        assert_eq!(
+            advance_scroll_request(true, true, false, TAIL_SETTLE_FRAMES),
+            (true, 1)
+        );
+        assert_eq!(advance_scroll_request(true, true, false, 1), (false, 0));
+        assert_eq!(
+            advance_scroll_request(true, false, true, TAIL_SETTLE_FRAMES),
+            (false, 0)
+        );
     }
 
     #[test]
@@ -1451,6 +1981,20 @@ mod tests {
             stable_value_color("backend"),
             stable_value_color("renderer")
         );
+    }
+
+    #[test]
+    fn clicking_an_included_facet_again_clears_it_even_with_hidden_values() {
+        let mut selection = FacetSelection::default();
+        selection.toggle_exclude("hidden");
+
+        apply_primary_facet_click(&mut selection, "visible", false);
+        assert!(selection.included.contains("visible"));
+        assert!(selection.excluded.contains("hidden"));
+
+        apply_primary_facet_click(&mut selection, "visible", false);
+        assert!(selection.included.is_empty());
+        assert!(selection.excluded.contains("hidden"));
     }
 
     #[test]
