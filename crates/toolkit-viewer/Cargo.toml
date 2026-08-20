@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 crossbeam-channel.workspace = true
 dee-bugee-core = { path = "../toolkit-core" }
 dee-bugee-schema = { path = "../toolkit-schema" }

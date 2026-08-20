@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::Local;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use dee_bugee_core::{
     DEFAULT_MAX_EVENTS, EventStore, FacetSelection, FilterState, PRIMARY_FACETS, SearchSnapshot,
@@ -41,6 +42,7 @@ const TAIL_HEADROOM_ROWS: f32 = 2.5;
 const LATEST_SETTLE_FRAMES: u8 = 2;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 const MAX_CONFIGURABLE_EVENTS: usize = 5_000_000;
+const DEFAULT_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f %:z";
 
 const SURFACE_0: Color32 = Color32::from_rgb(13, 16, 22);
 const SURFACE_1: Color32 = Color32::from_rgb(18, 22, 29);
@@ -353,6 +355,39 @@ enum TableColumn {
     Message,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+enum TimestampDisplay {
+    #[default]
+    Local,
+    Utc,
+}
+
+impl TimestampDisplay {
+    const ALL: [Self; 2] = [Self::Local, Self::Utc];
+
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Local => "Local Time",
+            Self::Utc => "UTC",
+        }
+    }
+
+    fn format(self, event: &LogEvent, format: &str) -> String {
+        match self {
+            Self::Local => event
+                .timestamp
+                .with_timezone(&Local)
+                .format(format)
+                .to_string(),
+            Self::Utc => event.timestamp.format(format).to_string(),
+        }
+    }
+}
+
+fn default_timestamp_format() -> String {
+    DEFAULT_TIMESTAMP_FORMAT.to_string()
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ColorBy {
@@ -432,6 +467,16 @@ struct FilterBookmark {
     filter: FilterState,
 }
 
+/// A collapsed run of equivalent events in the current filtered view.
+/// The newest occurrence remains the table representative, so a live event burst
+/// stays at the newest point in the log rather than being stranded at its first row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ErrorGroup {
+    count: usize,
+    first_index: usize,
+    latest_index: usize,
+}
+
 impl TableColumn {
     const ALL: [Self; 11] = [
         Self::Timestamp,
@@ -465,17 +510,17 @@ impl TableColumn {
 
     fn layout(self) -> Column {
         match self {
-            Self::Timestamp => Column::initial(185.0).at_least(140.0),
-            Self::Level => Column::initial(76.0).at_least(70.0),
-            Self::Source => Column::initial(90.0).at_least(65.0),
-            Self::Tag => Column::initial(130.0).at_least(85.0),
-            Self::Subsystem => Column::initial(110.0).at_least(75.0),
-            Self::Event => Column::initial(150.0).at_least(90.0),
-            Self::Provider => Column::initial(90.0).at_least(65.0),
-            Self::Correlation => Column::initial(145.0).at_least(90.0),
-            Self::Duration => Column::initial(82.0).at_least(65.0),
-            Self::Status => Column::initial(70.0).at_least(55.0),
-            Self::Message => Column::remainder().at_least(240.0),
+            Self::Timestamp => Column::initial(225.0),
+            Self::Level => Column::initial(76.0),
+            Self::Source => Column::initial(90.0),
+            Self::Tag => Column::initial(130.0),
+            Self::Subsystem => Column::initial(110.0),
+            Self::Event => Column::initial(150.0),
+            Self::Provider => Column::initial(90.0),
+            Self::Correlation => Column::initial(145.0),
+            Self::Duration => Column::initial(82.0),
+            Self::Status => Column::initial(70.0),
+            Self::Message => Column::remainder(),
         }
     }
 }
@@ -498,6 +543,10 @@ fn normalize_column_order(columns: Vec<TableColumn>) -> Vec<TableColumn> {
 #[serde(default)]
 struct ViewerPreferences {
     version: u16,
+    #[serde(default)]
+    sources: Vec<PathBuf>,
+    #[serde(default)]
+    filter: FilterState,
     column_order: Vec<TableColumn>,
     wrapped_messages: bool,
     semantic_highlighting: bool,
@@ -506,12 +555,17 @@ struct ViewerPreferences {
     bookmarks: Vec<FilterBookmark>,
     latest_at: LatestAt,
     max_events: usize,
+    timestamp_display: TimestampDisplay,
+    timestamp_format: String,
+    group_errors: bool,
 }
 
 impl Default for ViewerPreferences {
     fn default() -> Self {
         Self {
             version: 1,
+            sources: Vec::new(),
+            filter: FilterState::default(),
             column_order: default_column_order(),
             wrapped_messages: true,
             semantic_highlighting: false,
@@ -520,6 +574,9 @@ impl Default for ViewerPreferences {
             bookmarks: Vec::new(),
             latest_at: LatestAt::Bottom,
             max_events: DEFAULT_MAX_EVENTS,
+            timestamp_display: TimestampDisplay::default(),
+            timestamp_format: default_timestamp_format(),
+            group_errors: false,
         }
     }
 }
@@ -543,6 +600,12 @@ struct WorkspaceConfig {
     column_order: Vec<TableColumn>,
     #[serde(default = "default_max_events")]
     max_events: usize,
+    #[serde(default)]
+    timestamp_display: TimestampDisplay,
+    #[serde(default = "default_timestamp_format")]
+    timestamp_format: String,
+    #[serde(default)]
+    group_errors: bool,
 }
 
 const fn default_max_events() -> usize {
@@ -674,6 +737,11 @@ pub struct ViewerApp {
     text_matches_event_count: usize,
     text_matches_discarded_events: u64,
     max_events: usize,
+    timestamp_display: TimestampDisplay,
+    timestamp_format: String,
+    group_errors: bool,
+    table_rows: Vec<usize>,
+    error_groups: BTreeMap<usize, ErrorGroup>,
     event_limit_reload_pending: bool,
 }
 
@@ -692,15 +760,24 @@ impl ViewerApp {
         preferences.column_order = normalize_column_order(preferences.column_order);
         preferences.max_events = preferences.max_events.clamp(1, MAX_CONFIGURABLE_EVENTS);
 
-        let reader = spawn_reader(initial_paths);
+        // An explicit file or folder launch is intentional, so it takes precedence
+        // over the previous session. Normal launches reopen the exact log files the
+        // user had open last time.
+        let restored_sources = initial_paths
+            .is_empty()
+            .then(|| preferences.sources.clone());
+        let paths_to_open = restored_sources.clone().unwrap_or(initial_paths);
+        let reader = spawn_reader(paths_to_open);
         let search_worker = SearchWorker::spawn(creation_context.egui_ctx.clone());
         let mut app = Self {
             store: EventStore::new(preferences.max_events),
-            filter: FilterState::default(),
+            filter: preferences.filter,
             visible_rows: Vec::new(),
             facet_counts: BTreeMap::new(),
             reader,
-            sources: Vec::new(),
+            // Seed saved sources immediately so a quick close cannot replace the
+            // remembered session before the reader has announced every file.
+            sources: restored_sources.unwrap_or_default(),
             selected_row: None,
             invalid_records: 0,
             last_error: None,
@@ -728,9 +805,17 @@ impl ViewerApp {
             text_matches_event_count: 0,
             text_matches_discarded_events: 0,
             max_events: preferences.max_events,
+            timestamp_display: preferences.timestamp_display,
+            timestamp_format: preferences.timestamp_format,
+            group_errors: preferences.group_errors,
+            table_rows: Vec::new(),
+            error_groups: BTreeMap::new(),
             event_limit_reload_pending: false,
         };
         app.refresh_filters();
+        if !app.filter.text.trim().is_empty() {
+            app.schedule_text_search(Duration::ZERO);
+        }
         app
     }
 
@@ -850,8 +935,92 @@ impl ViewerApp {
             .query_with_facets(&self.filter, &facets, text_matches);
         self.visible_rows = results.rows;
         order_visible_rows(&mut self.visible_rows, self.latest_at);
+        self.rebuild_table_rows();
         self.facet_counts = results.facet_counts;
         self.filters_dirty = false;
+    }
+
+    fn rebuild_table_rows(&mut self) {
+        self.table_rows.clear();
+        self.error_groups.clear();
+
+        if !self.group_errors {
+            self.table_rows.clone_from(&self.visible_rows);
+            return;
+        }
+
+        let mut groups = BTreeMap::<String, ErrorGroup>::new();
+        for index in &self.visible_rows {
+            let Some(event) = self.store.get(*index) else {
+                continue;
+            };
+            if !is_groupable_event(event) {
+                self.table_rows.push(*index);
+                continue;
+            }
+            let key = error_group_key(event);
+            let group = groups.entry(key).or_insert(ErrorGroup {
+                count: 0,
+                first_index: *index,
+                latest_index: *index,
+            });
+            group.count += 1;
+            // `visible_rows` uses the configured display order. Keep the first entry
+            // it encounters (the newest occurrence) as the representative.
+            if group.count == 1 {
+                self.table_rows.push(*index);
+            } else {
+                group.first_index = *index;
+            }
+        }
+
+        for group in groups.into_values() {
+            self.error_groups.insert(group.latest_index, group);
+        }
+
+        // In a bottom-latest view the first encountered record is older. Rebuild in
+        // reverse so each group is represented by its newest occurrence, then restore
+        // the user's requested table order.
+        if self.latest_at == LatestAt::Bottom {
+            self.table_rows.clear();
+            self.error_groups.clear();
+            let mut reverse_groups = BTreeMap::<String, ErrorGroup>::new();
+            for index in self.visible_rows.iter().rev() {
+                let Some(event) = self.store.get(*index) else {
+                    continue;
+                };
+                if !is_groupable_event(event) {
+                    continue;
+                }
+                let group = reverse_groups
+                    .entry(error_group_key(event))
+                    .or_insert(ErrorGroup {
+                        count: 0,
+                        first_index: *index,
+                        latest_index: *index,
+                    });
+                group.count += 1;
+                group.first_index = *index;
+            }
+            for group in reverse_groups.into_values() {
+                self.error_groups.insert(group.latest_index, group);
+            }
+            for index in &self.visible_rows {
+                let Some(event) = self.store.get(*index) else {
+                    continue;
+                };
+                if !is_groupable_event(event) || self.error_groups.contains_key(index) {
+                    self.table_rows.push(*index);
+                }
+            }
+        }
+
+        if self
+            .selected_row
+            .is_some_and(|selected| !self.table_rows.contains(&selected))
+        {
+            self.selected_row = None;
+        }
     }
 
     fn cached_search_is_current(&self) -> bool {
@@ -1056,6 +1225,9 @@ impl ViewerApp {
                 self.latest_at = workspace.latest_at;
                 self.column_order = normalize_column_order(workspace.column_order);
                 self.apply_event_limit(workspace.max_events);
+                self.timestamp_display = workspace.timestamp_display;
+                self.timestamp_format = workspace.timestamp_format;
+                self.group_errors = workspace.group_errors;
                 self.replace_paths(workspace.sources);
                 self.last_notice = Some(format!("Opened workspace {}", path.display()));
             }
@@ -1089,6 +1261,9 @@ impl ViewerApp {
             latest_at: self.latest_at,
             column_order: self.column_order.clone(),
             max_events: self.max_events,
+            timestamp_display: self.timestamp_display,
+            timestamp_format: self.timestamp_format.clone(),
+            group_errors: self.group_errors,
         };
         match toml::to_string_pretty(&workspace)
             .map_err(|error| error.to_string())
@@ -1143,24 +1318,24 @@ impl ViewerApp {
             .frame(toolbar_frame)
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Open logs").clicked()
+                    if ui.button("Open Logs").clicked()
                         && let Some(paths) = rfd::FileDialog::new()
                             .add_filter("JSON Lines", &["jsonl", "log"])
                             .pick_files()
                     {
                         self.add_paths(paths);
                     }
-                    if ui.button("Open folder").clicked()
+                    if ui.button("Open Folder").clicked()
                         && let Some(path) = rfd::FileDialog::new().pick_folder()
                     {
                         self.add_paths(vec![path]);
                     }
                     ui.menu_button("Workspace", |ui| {
-                        if ui.button("Open workspace…").clicked() {
+                        if ui.button("Open Workspace…").clicked() {
                             self.open_workspace();
                             ui.close();
                         }
-                        if ui.button("Save workspace as…").clicked() {
+                        if ui.button("Save Workspace As…").clicked() {
                             self.save_workspace();
                             ui.close();
                         }
@@ -1168,7 +1343,7 @@ impl ViewerApp {
                         if ui
                             .add_enabled(
                                 !self.visible_rows.is_empty(),
-                                egui::Button::new("Export filtered logs…"),
+                                egui::Button::new("Export Filtered Logs…"),
                             )
                             .clicked()
                         {
@@ -1176,12 +1351,19 @@ impl ViewerApp {
                             ui.close();
                         }
                     });
+                    self.settings_menu(ui);
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let total = self.store.len();
                         let shown = self.visible_rows.len();
+                        let table_rows = self.table_rows.len();
+                        let shown_label = if self.group_errors && table_rows != shown {
+                            format!("{table_rows} groups · {shown} events")
+                        } else {
+                            format!("{shown} shown")
+                        };
                         ui.label(
-                            RichText::new(format!("{shown} shown  ·  {total} loaded"))
+                            RichText::new(format!("{shown_label}  ·  {total} loaded"))
                                 .color(TEXT_MUTED),
                         );
                         if self.paused {
@@ -1205,6 +1387,14 @@ impl ViewerApp {
                         self.tail_was_at_bottom = true;
                         self.request_scroll_to_latest();
                     }
+                    if ui
+                        .add_enabled(!self.filter.text.is_empty(), egui::Button::new("Clear"))
+                        .on_hover_text("Clear the search text")
+                        .clicked()
+                    {
+                        self.filter.text.clear();
+                        self.filter_changed();
+                    }
                     if self.search_due_at.is_some() || self.search_in_flight {
                         ui.spinner();
                         ui.label(RichText::new("Searching…").small().color(TEXT_MUTED));
@@ -1215,7 +1405,7 @@ impl ViewerApp {
                             self.filter
                                 .minimum_level
                                 .map(|level| format!("{level} +"))
-                                .unwrap_or_else(|| "All levels".to_string()),
+                                .unwrap_or_else(|| "All Levels".to_string()),
                         )
                         .width(96.0)
                         .show_ui(ui, |ui| {
@@ -1223,7 +1413,7 @@ impl ViewerApp {
                                 .selectable_value(
                                     &mut self.filter.minimum_level,
                                     None,
-                                    "All levels",
+                                    "All Levels",
                                 )
                                 .changed()
                             {
@@ -1243,15 +1433,6 @@ impl ViewerApp {
                             }
                         });
 
-                    if ui
-                        .add_enabled(self.filter.is_active(), egui::Button::new("Clear"))
-                        .on_hover_text("Clear all search and facet filters")
-                        .clicked()
-                    {
-                        self.filter.clear();
-                        self.filter_changed();
-                    }
-
                     ui.separator();
                     if ui
                         .add(
@@ -1269,77 +1450,20 @@ impl ViewerApp {
                         }
                     }
                     if ui
-                        .checkbox(&mut self.stick_to_bottom, "Follow latest")
-                        .changed()
-                    {
-                        if self.stick_to_bottom {
-                            self.tail_was_at_bottom = true;
-                            self.request_scroll_to_latest();
-                        } else {
-                            self.scroll_to_bottom_requested = false;
-                            self.scroll_settle_frames = 0;
-                        }
-                    }
-                    let previous_latest_at = self.latest_at;
-                    egui::ComboBox::from_id_salt("latest_at")
-                        .selected_text(format!("Latest: {}", self.latest_at.title()))
-                        .show_ui(ui, |ui| {
-                            for option in LatestAt::ALL {
-                                ui.selectable_value(&mut self.latest_at, option, option.title());
-                            }
-                        });
-                    if self.latest_at != previous_latest_at {
-                        self.filter_changed();
-                    }
-                    let wrap_changed = ui.checkbox(&mut self.wrapped_messages, "Wrap").changed();
-                    if should_reanchor_after_wrap(
-                        wrap_changed,
-                        self.stick_to_bottom,
-                        self.tail_was_at_bottom,
-                        self.scroll_to_bottom_requested,
-                    ) {
-                        // Wrapping changes the virtual height of every message row. Preserve
-                        // the current latest anchor instead of retaining an offset calculated
-                        // for the old layout.
-                        self.request_scroll_to_latest();
-                    }
-                    ui.checkbox(&mut self.semantic_highlighting, "Highlight terms")
-                        .on_hover_text(
-                            "Color positive, negative, warning, and activity phrases in log messages",
-                        );
-                    egui::ComboBox::from_id_salt("color_by")
-                        .selected_text(format!("Color: {}", self.color_by.title()))
-                        .show_ui(ui, |ui| {
-                            for option in ColorBy::ALL {
-                                ui.selectable_value(&mut self.color_by, option, option.title());
-                            }
-                        });
-                    ui.separator();
-                    ui.label(RichText::new("Keep latest").color(TEXT_MUTED));
-                    let mut max_events = self.max_events;
-                    let limit_response = ui
                         .add(
-                            egui::DragValue::new(&mut max_events)
-                                .range(1..=MAX_CONFIGURABLE_EVENTS)
-                                .speed(100.0),
+                            egui::Button::new("Group Repeats").selected(self.group_errors),
                         )
                         .on_hover_text(
-                            "Maximum logs kept in memory; pruning pauses while you read older entries",
-                        );
-                    if limit_response.changed() {
-                        self.apply_event_limit(max_events);
-                        self.event_limit_reload_pending = true;
+                            "Collapse matching repeated events into one row. Level filters and exports remain unchanged.",
+                        )
+                        .clicked()
+                    {
+                        self.group_errors = !self.group_errors;
+                        self.rebuild_table_rows();
+                        if self.tail_was_at_bottom {
+                            self.request_scroll_to_latest();
+                        }
                     }
-                    let commit_limit = self.event_limit_reload_pending
-                        && (limit_response.drag_stopped()
-                            || limit_response.lost_focus()
-                            || (!limit_response.has_focus() && !limit_response.dragged())
-                            || (limit_response.has_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter))));
-                    if commit_limit {
-                        self.reload_current_sources();
-                    }
-                    ui.label(RichText::new("logs").color(TEXT_MUTED));
                 });
 
                 if let Some(error) = self.last_error.clone() {
@@ -1381,6 +1505,139 @@ impl ViewerApp {
                         });
                 }
             });
+    }
+
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Settings", |ui| {
+            ui.set_min_width(340.0);
+
+            ui.label(RichText::new("Live View").strong());
+            if ui
+                .checkbox(&mut self.stick_to_bottom, "Follow Latest Events")
+                .changed()
+            {
+                if self.stick_to_bottom {
+                    self.tail_was_at_bottom = true;
+                    self.request_scroll_to_latest();
+                } else {
+                    self.scroll_to_bottom_requested = false;
+                    self.scroll_settle_frames = 0;
+                }
+            }
+            let previous_latest_at = self.latest_at;
+            egui::ComboBox::from_id_salt("settings_latest_at")
+                .selected_text(format!("Place Latest Events: {}", self.latest_at.title()))
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for option in LatestAt::ALL {
+                        ui.selectable_value(&mut self.latest_at, option, option.title());
+                    }
+                });
+            if self.latest_at != previous_latest_at {
+                self.filter_changed();
+            }
+
+            ui.separator();
+            ui.label(RichText::new("Table Appearance").strong());
+            let wrap_changed = ui
+                .checkbox(&mut self.wrapped_messages, "Wrap Message Text")
+                .changed();
+            if should_reanchor_after_wrap(
+                wrap_changed,
+                self.stick_to_bottom,
+                self.tail_was_at_bottom,
+                self.scroll_to_bottom_requested,
+            ) {
+                // Wrapping changes the virtual height of every message row. Preserve
+                // the current latest anchor instead of retaining an offset calculated
+                // for the old layout.
+                self.request_scroll_to_latest();
+            }
+            ui.checkbox(&mut self.semantic_highlighting, "Highlight Meaningful Terms")
+                .on_hover_text(
+                    "Color positive, negative, warning, and activity phrases in log messages",
+                );
+            egui::ComboBox::from_id_salt("settings_color_by")
+                .selected_text(format!("Color Rows By: {}", self.color_by.title()))
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for option in ColorBy::ALL {
+                        ui.selectable_value(&mut self.color_by, option, option.title());
+                    }
+                });
+
+            ui.separator();
+            ui.label(RichText::new("Timestamps").strong());
+            egui::ComboBox::from_id_salt("settings_timestamp_display")
+                .selected_text(format!("Display: {}", self.timestamp_display.title()))
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for option in TimestampDisplay::ALL {
+                        ui.selectable_value(&mut self.timestamp_display, option, option.title());
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Display UTC log timestamps in your computer's local time, or keep UTC",
+                );
+            ui.label(RichText::new("Format").small().color(TEXT_MUTED));
+            ui.add_sized(
+                [310.0, 26.0],
+                egui::TextEdit::singleline(&mut self.timestamp_format)
+                    .hint_text("%Y-%m-%d %H:%M:%S%.3f %:z"),
+            );
+            ui.label(
+                RichText::new(
+                    "Tokens: %Y year  %m month  %d day  %H hour  %M minute  %S second  %.3f ms  %:z offset",
+                )
+                .small()
+                .color(TEXT_MUTED),
+            );
+            ui.horizontal_wrapped(|ui| {
+                for (label, format) in [
+                    ("Full", DEFAULT_TIMESTAMP_FORMAT),
+                    ("Date + Time", "%d/%m/%Y %H:%M:%S"),
+                    ("Time Only", "%H:%M:%S%.3f"),
+                    ("US 12-Hour", "%m/%d/%Y %I:%M:%S %p"),
+                ] {
+                    if ui.small_button(label).clicked() {
+                        self.timestamp_format = format.to_string();
+                    }
+                }
+            });
+            if ui.small_button("Reset Timestamp Format").clicked() {
+                self.timestamp_format = default_timestamp_format();
+            }
+
+            ui.separator();
+            ui.label(RichText::new("Data Retention").strong());
+            ui.label(
+                RichText::new("Maximum Events Kept in Memory").small().color(TEXT_MUTED),
+            );
+            let mut max_events = self.max_events;
+            let limit_response = ui
+                .add(
+                    egui::DragValue::new(&mut max_events)
+                        .range(1..=MAX_CONFIGURABLE_EVENTS)
+                        .speed(100.0),
+                )
+                .on_hover_text(
+                    "Pruning pauses while you read older entries. Changing this reloads the current sources.",
+                );
+            if limit_response.changed() {
+                self.apply_event_limit(max_events);
+                self.event_limit_reload_pending = true;
+            }
+            let commit_limit = self.event_limit_reload_pending
+                && (limit_response.drag_stopped()
+                    || limit_response.lost_focus()
+                    || (!limit_response.has_focus() && !limit_response.dragged())
+                    || (limit_response.has_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))));
+            if commit_limit {
+                self.reload_current_sources();
+            }
+        });
     }
 
     fn sidebar(&mut self, root: &mut egui::Ui) {
@@ -1463,7 +1720,7 @@ impl ViewerApp {
                         .collect();
                     if !extra_facets.is_empty() {
                         ui.separator();
-                        ui.label(RichText::new("Discovered fields").strong());
+                        ui.label(RichText::new("Discovered Fields").strong());
                     }
                     for facet in extra_facets {
                         let counts = self.facet_counts.get(&facet).cloned().unwrap_or_default();
@@ -1536,7 +1793,7 @@ impl ViewerApp {
             if ui
                 .add_enabled(
                     self.filter.is_active() && !already_saved,
-                    egui::Button::new("＋ Save current"),
+                    egui::Button::new("＋ Save Current"),
                 )
                 .on_hover_text("Save the current search and facet filters")
                 .clicked()
@@ -1579,6 +1836,16 @@ impl ViewerApp {
             return;
         };
         let semantic_highlighting = self.semantic_highlighting;
+        let group_detail = self.selected_row.and_then(|row| {
+            self.error_groups.get(&row).and_then(|group| {
+                error_group_summary(
+                    &self.store,
+                    *group,
+                    self.timestamp_display,
+                    &self.timestamp_format,
+                )
+            })
+        });
 
         egui::Panel::bottom("details")
             .resizable(true)
@@ -1592,7 +1859,7 @@ impl ViewerApp {
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Event details");
+                    ui.heading("Event Details");
                     ui.label(
                         RichText::new(event.level.to_string().to_uppercase())
                             .strong()
@@ -1600,15 +1867,27 @@ impl ViewerApp {
                             .color(level_color(event.level)),
                     );
                     ui.label(
-                        RichText::new(event.timestamp_text())
-                            .small()
-                            .color(TEXT_MUTED),
+                        RichText::new(
+                            self.timestamp_display
+                                .format(&event, &self.timestamp_format),
+                        )
+                        .small()
+                        .color(TEXT_MUTED),
                     );
-                    if ui.button("Filter by correlation").clicked() {
+                    if ui
+                        .button("Copy")
+                        .on_hover_text("Copy all event details")
+                        .clicked()
+                    {
+                        let raw = serde_json::to_string_pretty(&event)
+                            .unwrap_or_else(|error| format!("Unable to serialize event: {error}"));
+                        ui.ctx().copy_text(format!("{}\n\n{}", event.message, raw));
+                    }
+                    if ui.button("Filter By Correlation").clicked() {
                         self.filter.correlation = Some(event.correlation_id().to_string());
                         self.filter_changed();
                     }
-                    if self.filter.correlation.is_some() && ui.button("Clear correlation").clicked()
+                    if self.filter.correlation.is_some() && ui.button("Clear Correlation").clicked()
                     {
                         self.filter.correlation = None;
                         self.filter_changed();
@@ -1631,6 +1910,12 @@ impl ViewerApp {
                     } else {
                         ui.label(RichText::new(&event.message).strong().size(15.0));
                     }
+                    if let Some(detail) = console_argument_summary(&event) {
+                        ui.label(RichText::new(detail).color(TEXT_MUTED));
+                    }
+                    if let Some(detail) = &group_detail {
+                        ui.label(RichText::new(detail).small().color(TEXT_MUTED));
+                    }
                     ui.separator();
                     let mut raw = serde_json::to_string_pretty(&event)
                         .unwrap_or_else(|error| format!("Unable to serialize event: {error}"));
@@ -1651,7 +1936,7 @@ impl ViewerApp {
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new("{  }").monospace().size(34.0).color(ACCENT));
                         ui.add_space(10.0);
-                        ui.heading("Open logs to start exploring");
+                        ui.heading("Open Logs to Start Exploring");
                         ui.label(
                             RichText::new(
                                 "Choose JSONL files, open a folder, or drop files anywhere in this window.",
@@ -1679,12 +1964,15 @@ impl ViewerApp {
                 (input.pointer.interact_pos(), input.smooth_scroll_delta.y)
             });
             let column_order = self.column_order.clone();
-            let visible_rows = &self.visible_rows;
+            let table_rows = &self.table_rows;
+            let error_groups = &self.error_groups;
             let store = &self.store;
             let wrapped = self.wrapped_messages;
             let semantic_highlighting = self.semantic_highlighting;
             let color_by = self.color_by;
             let latest_at = self.latest_at;
+            let timestamp_display = self.timestamp_display;
+            let timestamp_format = &self.timestamp_format;
             let scroll_to_bottom_requested = self.scroll_to_bottom_requested;
             let mut selected = self.selected_row;
             let mut requested_move = None;
@@ -1703,13 +1991,13 @@ impl ViewerApp {
                     for column in &column_order {
                         table = table.column(column.layout());
                     }
-                    if scroll_to_bottom_requested && !visible_rows.is_empty() {
+                    if scroll_to_bottom_requested && !table_rows.is_empty() {
                         table = match latest_at {
                             LatestAt::Top => table.vertical_scroll_offset(0.0),
                             // The final spacer row supplies deliberate breathing room below the
                             // newest record, so it is the true latest scroll target.
                             LatestAt::Bottom => table
-                                .scroll_to_row(visible_rows.len(), Some(egui::Align::BOTTOM)),
+                                .scroll_to_row(table_rows.len(), Some(egui::Align::BOTTOM)),
                         }
                         .animate_scrolling(false);
                     }
@@ -1800,18 +2088,28 @@ impl ViewerApp {
                                 .position(|column| *column == TableColumn::Message)
                                 .and_then(|index| body.widths().get(index).copied())
                                 .unwrap_or(400.0);
-                            let heights: Vec<f32> = visible_rows
+                            let heights: Vec<f32> = table_rows
                                 .iter()
                                 .map(|index| {
-                                    if !wrapped {
+                                    let Some(event) = store.get(*index) else {
                                         return row_height;
+                                    };
+                                    let group_detail = error_groups
+                                        .get(index)
+                                        .and_then(|group| error_group_summary(store, *group, timestamp_display, timestamp_format));
+                                    let detail_lines = usize::from(console_argument_summary(event).is_some())
+                                        + usize::from(group_detail.is_some());
+                                    if !wrapped {
+                                        return row_height * (1 + detail_lines) as f32;
                                     }
-                                    let chars = store
-                                        .get(*index)
-                                        .map_or(0, |event| event.message.chars().count());
+                                    let chars = event.message.chars().count()
+                                        + console_argument_summary(event)
+                                            .map_or(0, |detail| detail.chars().count() + 1)
+                                        + group_detail.map_or(0, |detail| detail.chars().count() + 1);
                                     let characters_per_line = (message_width / 7.2).max(12.0);
                                     let lines = ((chars as f32 / characters_per_line).ceil()
                                         as usize)
+                                        .max(1 + detail_lines)
                                         .clamp(1, 12);
                                     row_height * lines as f32
                                 })
@@ -1819,13 +2117,13 @@ impl ViewerApp {
                                 .collect();
 
                             body.heterogeneous_rows(heights.into_iter(), |mut row| {
-                                if row.index() == visible_rows.len() {
+                                if row.index() == table_rows.len() {
                                     for _ in &column_order {
                                         row.col(|_| {});
                                     }
                                     return;
                                 }
-                                let Some(store_index) = visible_rows.get(row.index()).copied()
+                                let Some(store_index) = table_rows.get(row.index()).copied()
                                 else {
                                     return;
                                 };
@@ -1836,6 +2134,9 @@ impl ViewerApp {
                                     .event_value(event)
                                     .as_deref()
                                     .map(stable_value_color);
+                                let group_detail = error_groups
+                                    .get(&store_index)
+                                    .and_then(|group| error_group_summary(store, *group, timestamp_display, timestamp_format));
                                 row.set_selected(selected == Some(store_index));
                                 for column in &column_order {
                                     row.col(|ui| {
@@ -1846,8 +2147,13 @@ impl ViewerApp {
                                             ui,
                                             *column,
                                             event,
-                                            wrapped,
-                                            semantic_highlighting,
+                                            EventCellOptions {
+                                                wrapped,
+                                                semantic_highlighting,
+                                                timestamp_display,
+                                                timestamp_format,
+                                                group_detail: group_detail.as_deref(),
+                                            },
                                         );
                                     });
                                 }
@@ -2114,19 +2420,30 @@ fn is_phrase_separator(character: char) -> bool {
     matches!(character, ' ' | '_' | '-' | '/' | '.')
 }
 
+struct EventCellOptions<'a> {
+    wrapped: bool,
+    semantic_highlighting: bool,
+    timestamp_display: TimestampDisplay,
+    timestamp_format: &'a str,
+    group_detail: Option<&'a str>,
+}
+
 fn show_event_cell(
     ui: &mut egui::Ui,
     column: TableColumn,
     event: &LogEvent,
-    wrapped: bool,
-    semantic_highlighting: bool,
+    options: EventCellOptions<'_>,
 ) {
     match column {
         TableColumn::Timestamp => {
             ui.label(
-                RichText::new(event.timestamp_text())
-                    .monospace()
-                    .color(TEXT_MUTED),
+                RichText::new(
+                    options
+                        .timestamp_display
+                        .format(event, options.timestamp_format),
+                )
+                .monospace()
+                .color(TEXT_MUTED),
             );
         }
         TableColumn::Level => {
@@ -2167,7 +2484,7 @@ fn show_event_cell(
             optional_cell(ui, (status != "-").then_some(status.as_str()));
         }
         TableColumn::Message => {
-            let label = if semantic_highlighting {
+            let label = if options.semantic_highlighting {
                 Label::new(highlighted_message(
                     &event.message,
                     ui.visuals().text_color(),
@@ -2175,13 +2492,140 @@ fn show_event_cell(
             } else {
                 Label::new(&event.message)
             };
-            ui.add(if wrapped {
-                label.wrap()
-            } else {
-                label.truncate()
+            ui.vertical(|ui| {
+                ui.add(if options.wrapped {
+                    label.wrap()
+                } else {
+                    label.truncate()
+                });
+                if let Some(detail) = console_argument_summary(event) {
+                    let detail_label = Label::new(RichText::new(detail).color(TEXT_MUTED));
+                    ui.add(if options.wrapped {
+                        detail_label.wrap()
+                    } else {
+                        detail_label.truncate()
+                    });
+                }
+                if let Some(detail) = options.group_detail {
+                    let detail_label = Label::new(RichText::new(detail).small().color(TEXT_MUTED));
+                    ui.add(if options.wrapped {
+                        detail_label.wrap()
+                    } else {
+                        detail_label.truncate()
+                    });
+                }
             });
         }
     }
+}
+
+fn is_groupable_event(_event: &LogEvent) -> bool {
+    true
+}
+
+fn error_group_key(event: &LogEvent) -> String {
+    let stack = ["stack", "stack_trace", "error_stack"]
+        .iter()
+        .find_map(|key| event.fields.get(*key).and_then(serde_json::Value::as_str))
+        .unwrap_or_default();
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        event.source,
+        event.subsystem,
+        event.event,
+        event.error_kind.as_deref().unwrap_or_default(),
+        normalize_error_shape(&event.message),
+        normalize_error_shape(stack),
+    )
+}
+
+/// Removes volatile numbers and normalizes spacing while retaining the useful
+/// exception wording and call-site shape needed to avoid merging unrelated errors.
+fn normalize_error_shape(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut previous_was_space = true;
+    let mut in_digits = false;
+    for character in value.trim().chars() {
+        if character.is_ascii_digit() {
+            if !in_digits {
+                normalized.push('#');
+                in_digits = true;
+            }
+            previous_was_space = false;
+        } else if character.is_whitespace() {
+            if !previous_was_space {
+                normalized.push(' ');
+                previous_was_space = true;
+            }
+            in_digits = false;
+        } else {
+            normalized.extend(character.to_lowercase());
+            previous_was_space = false;
+            in_digits = false;
+        }
+    }
+    normalized.trim_end().to_string()
+}
+
+fn error_group_summary(
+    store: &EventStore,
+    group: ErrorGroup,
+    timestamp_display: TimestampDisplay,
+    timestamp_format: &str,
+) -> Option<String> {
+    (group.count > 1).then(|| {
+        let first = store
+            .get(group.first_index)
+            .map(|event| timestamp_display.format(event, timestamp_format))
+            .unwrap_or_else(|| "unknown".to_string());
+        let latest = store
+            .get(group.latest_index)
+            .map(|event| timestamp_display.format(event, timestamp_format))
+            .unwrap_or_else(|| "unknown".to_string());
+        format!(
+            "Repeated {} times · first {first} · latest {latest}",
+            group.count
+        )
+    })
+}
+
+/// Returns the useful error text from structured console arguments without changing the event.
+/// Console strings are already included in `message`; this is only for Error-like objects.
+fn console_argument_summary(event: &LogEvent) -> Option<String> {
+    if event.event != "console.message" {
+        return None;
+    }
+
+    let mut details = Vec::new();
+    let arguments = event
+        .fields
+        .get("arguments")
+        .or_else(|| event.fields.get("args"))?
+        .as_array()?;
+    for argument in arguments {
+        let Some(object) = argument.as_object() else {
+            continue;
+        };
+        let Some(message) = object
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty() && *message != event.message)
+        else {
+            continue;
+        };
+        let detail = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| message.to_string(), |name| format!("{name}: {message}"));
+        if !details.contains(&detail) {
+            details.push(detail);
+        }
+    }
+
+    (!details.is_empty()).then(|| details.join(" · "))
 }
 
 fn optional_cell(ui: &mut egui::Ui, value: Option<&str>) {
@@ -2369,6 +2813,8 @@ impl eframe::App for ViewerApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         let preferences = ViewerPreferences {
             version: 1,
+            sources: self.sources.clone(),
+            filter: self.filter.clone(),
             column_order: self.column_order.clone(),
             wrapped_messages: self.wrapped_messages,
             semantic_highlighting: self.semantic_highlighting,
@@ -2377,6 +2823,9 @@ impl eframe::App for ViewerApp {
             bookmarks: self.bookmarks.clone(),
             latest_at: self.latest_at,
             max_events: self.max_events,
+            timestamp_display: self.timestamp_display,
+            timestamp_format: self.timestamp_format.clone(),
+            group_errors: self.group_errors,
         };
         eframe::set_value(storage, PREFERENCES_KEY, &preferences);
     }
@@ -2472,6 +2921,94 @@ fn level_color(level: Level) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_display_keeps_utc_available_for_log_correlation() {
+        let event = LogEvent::new(
+            Level::Info,
+            "app",
+            "startup",
+            "app.started",
+            "Started",
+            "session",
+        );
+
+        assert_eq!(
+            TimestampDisplay::Utc.format(&event, "%H:%M:%S"),
+            event.timestamp.format("%H:%M:%S").to_string()
+        );
+        assert_ne!(
+            TimestampDisplay::Local.title(),
+            TimestampDisplay::Utc.title()
+        );
+    }
+
+    #[test]
+    fn console_error_arguments_are_shown_as_a_secondary_message() {
+        let mut event = LogEvent::new(
+            Level::Error,
+            "renderer",
+            "smart_next_autoload",
+            "console.message",
+            "[Smart Next Autoload] Source preparation failed:",
+            "session",
+        );
+        event.fields.insert(
+            "args".to_string(),
+            serde_json::json!([
+                { "name": "Error", "message": "No later aired episode is available yet." }
+            ]),
+        );
+
+        assert_eq!(
+            console_argument_summary(&event).as_deref(),
+            Some("Error: No later aired episode is available yet.")
+        );
+
+        event.event = "player.failed".to_string();
+        assert_eq!(console_argument_summary(&event), None);
+    }
+
+    #[test]
+    fn repeat_grouping_normalizes_volatile_numbers_without_merging_sources() {
+        let first = LogEvent::new(
+            Level::Error,
+            "backend",
+            "sync",
+            "request.failed",
+            "Request 1842 failed after 500 ms",
+            "session",
+        );
+        let second = LogEvent::new(
+            Level::Error,
+            "backend",
+            "sync",
+            "request.failed",
+            "Request 9917 failed after 20 ms",
+            "session",
+        );
+        let other_source = LogEvent::new(
+            Level::Error,
+            "renderer",
+            "sync",
+            "request.failed",
+            "Request 9917 failed after 20 ms",
+            "session",
+        );
+
+        assert_eq!(error_group_key(&first), error_group_key(&second));
+        assert_ne!(error_group_key(&first), error_group_key(&other_source));
+        let information = LogEvent::new(
+            Level::Info,
+            "backend",
+            "sync",
+            "request.finished",
+            "Request 9917 finished",
+            "session",
+        );
+        assert!(is_groupable_event(&first));
+        assert!(is_groupable_event(&information));
+    }
 
     #[test]
     fn semantic_highlighting_prefers_negative_compound_phrases() {

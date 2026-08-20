@@ -35,6 +35,18 @@ cd DeeBugee
 .\BUILD.bat
 ```
 
+`BUILD.bat` is the canonical release build. It increments the patch version before compiling (for example, `1.0.1` becomes `1.0.2`) and keeps the Rust workspace, Electron adapter, and .NET package on the same version. Commit the resulting version-file changes with the build you release.
+
+### Development with automatic reload
+
+Use `RUN.bat` for local development:
+
+```powershell
+.\RUN.bat "C:\Logs\Application.jsonl"
+```
+
+It runs the debug build through the included development watcher. Saving Rust source changes recompiles and restarts the native viewer; this is the native-app equivalent of Vite hot reload. `RUN.bat` never changes the application version. Stop the reload loop with `Ctrl+C`.
+
 The release executable is created at:
 
 ```text
