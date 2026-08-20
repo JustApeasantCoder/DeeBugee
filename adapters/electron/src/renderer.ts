@@ -111,13 +111,22 @@ function inferSubsystem(message: string): string {
 }
 
 function safeFields(fields: Record<string, unknown>): Record<string, unknown> {
-  return JSON.parse(JSON.stringify(fields, circularReplacer())) as Record<string, unknown>;
+  try {
+    return JSON.parse(JSON.stringify(fields, circularReplacer())) as Record<string, unknown>;
+  } catch (error) {
+    return {
+      logging_serialization_error: error instanceof Error
+        ? `${error.name}: ${error.message}`
+        : "Unable to serialize structured fields",
+    };
+  }
 }
 
 function circularReplacer(): (key: string, value: unknown) => unknown {
   const seen = new WeakSet<object>();
   return (key, value) => {
     if (isSensitiveKey(key)) return "[REDACTED]";
+    if (typeof value === "bigint") return value.toString();
     if (value instanceof Error) {
       return { name: value.name, message: value.message, stack: value.stack };
     }

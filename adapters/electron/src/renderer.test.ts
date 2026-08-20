@@ -21,3 +21,17 @@ test("renderer logger batches, redacts and infers subsystems", () => {
   assert.equal(event.fields.apiToken, "[REDACTED]");
   assert.equal(event.fields.self, "[Circular]");
 });
+
+test("renderer logger converts bigint fields without throwing", () => {
+  const sent: unknown[][] = [];
+  const logger = createRendererLogger(
+    { send(_channel, entries) { sent.push(entries); } },
+    { appSessionId: "app-1" },
+  );
+
+  assert.doesNotThrow(() => logger.log("info", "counter", "Counter updated", { count: 42n }));
+  logger.flush();
+
+  const event = sent.flat()[0] as Record<string, any>;
+  assert.equal(event.fields.count, "42");
+});
