@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs::{File, OpenOptions},
+    fs::{File, Metadata, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     thread,
@@ -128,6 +128,7 @@ struct FileCursor {
     partial: Vec<u8>,
     opened: bool,
     last_error: Option<String>,
+    file_identity: Option<FileIdentity>,
 }
 
 impl FileCursor {
@@ -137,17 +138,22 @@ impl FileCursor {
             return Err("source is not a regular file".to_string());
         }
 
-        if metadata.len() < self.offset {
+        let mut file = open_shared(path).map_err(|error| error.to_string())?;
+        let file_identity = file_identity(&file, &metadata);
+        let replaced = self
+            .file_identity
+            .is_some_and(|previous| Some(previous) != file_identity);
+        if replaced || metadata.len() < self.offset {
             self.offset = 0;
             self.line = 0;
             self.partial.clear();
         }
+        self.file_identity = file_identity;
         if metadata.len() == self.offset {
             self.announce_open(path, messages);
             return Ok(());
         }
 
-        let mut file = open_shared(path).map_err(|error| error.to_string())?;
         file.seek(SeekFrom::Start(self.offset))
             .map_err(|error| error.to_string())?;
         let available = metadata.len().saturating_sub(self.offset);
@@ -207,6 +213,43 @@ impl FileCursor {
             let _ = messages.send(ReaderMessage::Batch(batch));
         }
     }
+}
+
+#[cfg(windows)]
+type FileIdentity = (u32, u64);
+
+#[cfg(windows)]
+fn file_identity(file: &File, _metadata: &Metadata) -> Option<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    (succeeded != 0).then(|| {
+        let index =
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+        (information.dwVolumeSerialNumber, index)
+    })
+}
+
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+
+#[cfg(unix)]
+fn file_identity(_file: &File, metadata: &Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(any(windows, unix)))]
+type FileIdentity = ();
+
+#[cfg(not(any(windows, unix)))]
+fn file_identity(_file: &File, _metadata: &Metadata) -> Option<FileIdentity> {
+    None
 }
 
 #[cfg(windows)]
@@ -279,5 +322,55 @@ mod tests {
 
         assert_eq!(events, vec![event]);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cursor_restarts_when_a_rotated_file_is_replaced() {
+        let path = std::env::temp_dir().join(format!(
+            "dee-bugee-follower-rotation-{}.jsonl",
+            std::process::id()
+        ));
+        let archive = path.with_extension("jsonl.1");
+        let first = LogEvent::new(Level::Info, "backend", "test", "first", "first", "app-1");
+        let second = LogEvent::new(
+            Level::Info,
+            "backend",
+            "test",
+            "second",
+            "a replacement record long enough to exceed the previous cursor offset",
+            "app-1",
+        );
+        let (sender, receiver) = bounded(8);
+        let mut cursor = FileCursor::default();
+
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&first).unwrap()),
+        )
+        .unwrap();
+        cursor.poll(&path, &sender).unwrap();
+        let _ = receiver.try_iter().collect::<Vec<_>>();
+
+        std::fs::rename(&path, &archive).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&second).unwrap()),
+        )
+        .unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() >= cursor.offset);
+        cursor.poll(&path, &sender).unwrap();
+
+        let events: Vec<_> = receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                ReaderMessage::Batch(events) => Some(events),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(events, vec![second]);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(archive);
     }
 }

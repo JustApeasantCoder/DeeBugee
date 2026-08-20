@@ -12,7 +12,8 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use dee_bugee_core::{
-    EventStore, FacetSelection, FilterState, PRIMARY_FACETS, SearchSnapshot, status_text,
+    DEFAULT_MAX_EVENTS, EventStore, FacetSelection, FilterState, PRIMARY_FACETS, SearchSnapshot,
+    status_text,
 };
 use dee_bugee_schema::{Level, LogEvent};
 use eframe::egui::{
@@ -35,9 +36,10 @@ const DISPLAYED_FACETS: [&str; 9] = [
     "correlation",
 ];
 const PREFERENCES_KEY: &str = "dee_bugee.viewer_preferences.v1";
-const TAIL_HEADROOM_ROWS: f32 = 6.0;
+const TAIL_HEADROOM_ROWS: f32 = 2.5;
 const TAIL_SETTLE_FRAMES: u8 = 2;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
+const MAX_CONFIGURABLE_EVENTS: usize = 5_000_000;
 
 const SURFACE_0: Color32 = Color32::from_rgb(13, 16, 22);
 const SURFACE_1: Color32 = Color32::from_rgb(18, 22, 29);
@@ -52,6 +54,21 @@ const WARNING: Color32 = Color32::from_rgb(240, 184, 82);
 const DANGER: Color32 = Color32::from_rgb(242, 108, 122);
 
 fn configure_ui(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    install_system_font(
+        &mut fonts,
+        FontFamily::Proportional,
+        "dee_bugee_ui",
+        &["Inter-Regular.ttf", "segoeui.ttf"],
+    );
+    install_system_font(
+        &mut fonts,
+        FontFamily::Monospace,
+        "dee_bugee_mono",
+        &["CascadiaMono.ttf", "consola.ttf"],
+    );
+    ctx.set_fonts(fonts);
+
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = SURFACE_0;
     visuals.window_fill = SURFACE_1;
@@ -112,6 +129,47 @@ fn configure_ui(ctx: &egui::Context) {
         ]
         .into();
     });
+}
+
+fn install_system_font(
+    fonts: &mut egui::FontDefinitions,
+    family: FontFamily,
+    name: &str,
+    candidates: &[&str],
+) {
+    let Some(bytes) = load_windows_font(candidates) else {
+        return;
+    };
+    fonts.font_data.insert(
+        name.to_string(),
+        Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    fonts
+        .families
+        .entry(family)
+        .or_default()
+        .insert(0, name.to_string());
+}
+
+fn load_windows_font(candidates: &[&str]) -> Option<Vec<u8>> {
+    let mut font_directories = Vec::new();
+    if let Some(windows_dir) = std::env::var_os("WINDIR") {
+        font_directories.push(PathBuf::from(windows_dir).join("Fonts"));
+    }
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        font_directories.push(
+            PathBuf::from(local_app_data)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Fonts"),
+        );
+    }
+
+    font_directories.iter().find_map(|directory| {
+        candidates
+            .iter()
+            .find_map(|candidate| std::fs::read(directory.join(candidate)).ok())
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -281,6 +339,7 @@ struct ViewerPreferences {
     color_by: ColorBy,
     bookmarks: Vec<FilterBookmark>,
     latest_at: LatestAt,
+    max_events: usize,
 }
 
 impl Default for ViewerPreferences {
@@ -293,6 +352,7 @@ impl Default for ViewerPreferences {
             color_by: ColorBy::Off,
             bookmarks: Vec::new(),
             latest_at: LatestAt::Bottom,
+            max_events: DEFAULT_MAX_EVENTS,
         }
     }
 }
@@ -312,6 +372,12 @@ struct WorkspaceConfig {
     latest_at: LatestAt,
     #[serde(default = "default_column_order")]
     column_order: Vec<TableColumn>,
+    #[serde(default = "default_max_events")]
+    max_events: usize,
+}
+
+const fn default_max_events() -> usize {
+    DEFAULT_MAX_EVENTS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,6 +503,8 @@ pub struct ViewerApp {
     text_matches_query: String,
     text_matches_event_count: usize,
     text_matches_discarded_events: u64,
+    max_events: usize,
+    event_limit_reload_pending: bool,
 }
 
 impl ViewerApp {
@@ -452,11 +520,12 @@ impl ViewerApp {
             .filter(|preferences| preferences.version == 1)
             .unwrap_or_default();
         preferences.column_order = normalize_column_order(preferences.column_order);
+        preferences.max_events = preferences.max_events.clamp(1, MAX_CONFIGURABLE_EVENTS);
 
         let reader = spawn_reader(initial_paths);
         let search_worker = SearchWorker::spawn(creation_context.egui_ctx.clone());
         let mut app = Self {
-            store: EventStore::default(),
+            store: EventStore::new(preferences.max_events),
             filter: FilterState::default(),
             visible_rows: Vec::new(),
             facet_counts: BTreeMap::new(),
@@ -487,12 +556,15 @@ impl ViewerApp {
             text_matches_query: String::new(),
             text_matches_event_count: 0,
             text_matches_discarded_events: 0,
+            max_events: preferences.max_events,
+            event_limit_reload_pending: false,
         };
         app.refresh_filters();
         app
     }
 
     fn drain_reader(&mut self) {
+        self.store.set_pruning_paused(!self.tail_was_at_bottom);
         let mut received_events = false;
         loop {
             match self.reader.messages.try_recv() {
@@ -529,7 +601,7 @@ impl ViewerApp {
                 self.schedule_text_search(Duration::ZERO);
             }
         }
-        if received_events && !self.paused {
+        if received_events && !self.paused && self.tail_was_at_bottom {
             self.filters_dirty = true;
             if self.stick_to_bottom && (self.tail_was_at_bottom || self.scroll_to_bottom_requested)
             {
@@ -547,23 +619,6 @@ impl ViewerApp {
         self.filters_dirty = true;
         self.tail_was_at_bottom = true;
         self.request_scroll_to_latest();
-    }
-
-    fn jump_to_latest_button(&mut self, ui: &mut egui::Ui) {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let label = match self.latest_at {
-                LatestAt::Top => "↑ Jump To latest",
-                LatestAt::Bottom => "↓ Jump To latest",
-            };
-            if ui
-                .button(label)
-                .on_hover_text("Jump to the newest matching event")
-                .clicked()
-            {
-                self.tail_was_at_bottom = true;
-                self.request_scroll_to_latest();
-            }
-        });
     }
 
     fn displayed_facets(&self) -> Vec<String> {
@@ -699,6 +754,61 @@ impl ViewerApp {
         }
     }
 
+    fn apply_event_limit(&mut self, max_events: usize) {
+        self.max_events = max_events.clamp(1, MAX_CONFIGURABLE_EVENTS);
+        let previous_discarded = self.store.discarded_events();
+        self.store.set_max_events(self.max_events);
+        if self.store.discarded_events() == previous_discarded {
+            return;
+        }
+
+        self.selected_row = None;
+        self.last_discarded_events = self.store.discarded_events();
+        self.search_generation = self.search_worker.next_generation();
+        self.search_due_at = None;
+        self.search_in_flight = false;
+        self.text_matches.clear();
+        self.text_matches_query.clear();
+        self.text_matches_event_count = 0;
+        self.text_matches_discarded_events = 0;
+        if !self.filter.text.trim().is_empty() && !self.paused {
+            self.schedule_text_search(Duration::ZERO);
+        }
+        self.filters_dirty = true;
+        self.tail_was_at_bottom = true;
+        self.request_scroll_to_latest();
+    }
+
+    fn replace_paths(&mut self, paths: Vec<PathBuf>) {
+        self.reader = spawn_reader(paths);
+        self.store = EventStore::new(self.max_events);
+        self.sources.clear();
+        self.selected_row = None;
+        self.invalid_records = 0;
+        self.last_error = None;
+        self.last_discarded_events = 0;
+        self.search_generation = self.search_worker.next_generation();
+        self.search_due_at = None;
+        self.search_in_flight = false;
+        self.text_matches.clear();
+        self.text_matches_query.clear();
+        self.text_matches_event_count = 0;
+        self.text_matches_discarded_events = 0;
+        self.filters_dirty = true;
+        self.tail_was_at_bottom = true;
+        self.event_limit_reload_pending = false;
+        self.request_scroll_to_latest();
+    }
+
+    fn reload_current_sources(&mut self) {
+        let paths = self.sources.clone();
+        if paths.is_empty() {
+            self.event_limit_reload_pending = false;
+            return;
+        }
+        self.replace_paths(paths);
+    }
+
     fn open_workspace(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Toolkit workspace", &["toml"])
@@ -720,8 +830,8 @@ impl ViewerApp {
                 self.bookmarks = workspace.bookmarks;
                 self.latest_at = workspace.latest_at;
                 self.column_order = normalize_column_order(workspace.column_order);
-                self.add_paths(workspace.sources);
-                self.filters_dirty = true;
+                self.apply_event_limit(workspace.max_events);
+                self.replace_paths(workspace.sources);
                 self.last_notice = Some(format!("Opened workspace {}", path.display()));
             }
             Ok(workspace) => {
@@ -752,6 +862,7 @@ impl ViewerApp {
             bookmarks: self.bookmarks.clone(),
             latest_at: self.latest_at,
             column_order: self.column_order.clone(),
+            max_events: self.max_events,
         };
         match toml::to_string_pretty(&workspace)
             .map_err(|error| error.to_string())
@@ -958,6 +1069,32 @@ impl ViewerApp {
                                 ui.selectable_value(&mut self.color_by, option, option.title());
                             }
                         });
+                    ui.separator();
+                    ui.label(RichText::new("Keep latest").color(TEXT_MUTED));
+                    let mut max_events = self.max_events;
+                    let limit_response = ui
+                        .add(
+                            egui::DragValue::new(&mut max_events)
+                                .range(1..=MAX_CONFIGURABLE_EVENTS)
+                                .speed(100.0),
+                        )
+                        .on_hover_text(
+                            "Maximum logs kept in memory; pruning pauses while you read older entries",
+                        );
+                    if limit_response.changed() {
+                        self.apply_event_limit(max_events);
+                        self.event_limit_reload_pending = true;
+                    }
+                    let commit_limit = self.event_limit_reload_pending
+                        && (limit_response.drag_stopped()
+                            || limit_response.lost_focus()
+                            || (!limit_response.has_focus() && !limit_response.dragged())
+                            || (limit_response.has_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter))));
+                    if commit_limit {
+                        self.reload_current_sources();
+                    }
+                    ui.label(RichText::new("logs").color(TEXT_MUTED));
                 });
 
                 if let Some(error) = self.last_error.clone() {
@@ -975,25 +1112,12 @@ impl ViewerApp {
                                 }
                             });
                         });
-                } else if self.invalid_records > 0 || self.store.discarded_events() > 0 {
+                } else if self.invalid_records > 0 {
                     ui.add_space(5.0);
-                    ui.horizontal(|ui| {
-                        if self.invalid_records > 0 {
-                            ui.label(
-                                RichText::new(format!("{} invalid records", self.invalid_records))
-                                    .color(WARNING),
-                            );
-                        }
-                        if self.store.discarded_events() > 0 {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} outside memory window",
-                                    self.store.discarded_events()
-                                ))
-                                .color(WARNING),
-                            );
-                        }
-                    });
+                    ui.label(
+                        RichText::new(format!("{} invalid records", self.invalid_records))
+                            .color(WARNING),
+                    );
                 }
                 if let Some(notice) = self.last_notice.clone() {
                     ui.add_space(5.0);
@@ -1292,10 +1416,6 @@ impl ViewerApp {
 
             self.bookmark_bar(ui);
 
-            if self.latest_at == LatestAt::Top {
-                self.jump_to_latest_button(ui);
-            }
-
             let row_height = ui.text_style_height(&TextStyle::Body) + 8.0;
             let manual_wheel_scroll = ui.rect_contains_pointer(ui.max_rect())
                 && ui.input(|input| input.smooth_scroll_delta.y.abs() > f32::EPSILON);
@@ -1310,16 +1430,10 @@ impl ViewerApp {
             let mut selected = self.selected_row;
             let mut requested_move = None;
             let table_content_width = ui.available_width().max(1_400.0);
-            let table_height = if latest_at == LatestAt::Bottom {
-                (ui.available_height() - 30.0).max(0.0)
-            } else {
-                ui.available_height()
-            };
             let mut horizontal_output = egui::ScrollArea::horizontal()
                 .id_salt("events_horizontal_scroll")
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .auto_shrink([false, false])
-                .max_height(table_height)
                 .show(ui, |ui| {
                     ui.set_min_width(table_content_width);
                     let mut table = TableBuilder::new(ui)
@@ -1330,14 +1444,11 @@ impl ViewerApp {
                     for column in &column_order {
                         table = table.column(column.layout());
                     }
-                    if scroll_to_bottom_requested && !visible_rows.is_empty() {
-                        let (row, alignment) = match latest_at {
-                            LatestAt::Bottom => (visible_rows.len(), egui::Align::BOTTOM),
-                            LatestAt::Top => (0, egui::Align::TOP),
-                        };
-                        table = table
-                            .scroll_to_row(row, Some(alignment))
-                            .animate_scrolling(false);
+                    if scroll_to_bottom_requested
+                        && !visible_rows.is_empty()
+                        && latest_at == LatestAt::Top
+                    {
+                        table = table.vertical_scroll_offset(0.0).animate_scrolling(false);
                     }
 
                     table
@@ -1521,9 +1632,14 @@ impl ViewerApp {
                 ui.ctx().request_repaint();
             }
 
-            let vertical_output = &horizontal_output.inner;
+            let vertical_output = &mut horizontal_output.inner;
             let manually_scrolled =
                 manual_wheel_scroll || (middle_panned && pointer_delta.y.abs() > f32::EPSILON);
+            if scroll_to_bottom_requested && !manually_scrolled && latest_at == LatestAt::Bottom {
+                vertical_output.state.offset.y =
+                    (vertical_output.content_size.y - vertical_output.inner_rect.height()).max(0.0);
+                vertical_output.state.store(ui.ctx(), vertical_output.id);
+            }
             self.tail_was_at_bottom = scroll_is_at_latest(
                 vertical_output.state.offset.y,
                 vertical_output.content_size.y,
@@ -1535,6 +1651,9 @@ impl ViewerApp {
                 },
                 latest_at,
             );
+            if !self.tail_was_at_bottom {
+                self.store.set_pruning_paused(true);
+            }
             // `scroll_to_row` updates the persisted offset after this frame. Keep the
             // request alive until the following frame observes that the viewport
             // really reached the end; otherwise a busy stream can disable tailing
@@ -1554,8 +1673,42 @@ impl ViewerApp {
                 move_column(&mut self.column_order, source, target, insert_after);
             }
 
-            if latest_at == LatestAt::Bottom {
-                self.jump_to_latest_button(ui);
+            if !self.tail_was_at_bottom {
+                let table_rect = horizontal_output.inner_rect;
+                let (position, pivot, label) = match latest_at {
+                    LatestAt::Top => (
+                        egui::pos2(table_rect.center().x, table_rect.top() + 12.0),
+                        egui::Align2::CENTER_TOP,
+                        "↑  Jump to latest",
+                    ),
+                    LatestAt::Bottom => (
+                        egui::pos2(table_rect.center().x, table_rect.bottom() - 12.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        "↓  Jump to latest",
+                    ),
+                };
+                let jump_clicked = egui::Area::new(egui::Id::new("jump_to_latest"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(position)
+                    .pivot(pivot)
+                    .show(ui.ctx(), |ui| {
+                        ui.add(
+                            egui::Button::new(
+                                RichText::new(label).strong().color(TEXT_PRIMARY),
+                            )
+                            .fill(SURFACE_2)
+                            .stroke(Stroke::new(1.0, BORDER))
+                            .corner_radius(8)
+                            .min_size(egui::vec2(0.0, 36.0)),
+                        )
+                        .on_hover_text("Jump to the newest matching event")
+                    })
+                    .inner
+                    .clicked();
+                if jump_clicked {
+                    self.tail_was_at_bottom = true;
+                    self.request_scroll_to_latest();
+                }
             }
         });
     }
@@ -1730,7 +1883,7 @@ impl eframe::App for ViewerApp {
         });
         self.add_paths(dropped_paths);
 
-        if !self.paused {
+        if !self.paused && self.tail_was_at_bottom {
             if self.filter.text.trim().is_empty() {
                 if self.search_due_at.take().is_some() || self.search_in_flight {
                     self.search_generation = self.search_worker.next_generation();
@@ -1772,6 +1925,7 @@ impl eframe::App for ViewerApp {
             color_by: self.color_by,
             bookmarks: self.bookmarks.clone(),
             latest_at: self.latest_at,
+            max_events: self.max_events,
         };
         eframe::set_value(storage, PREFERENCES_KEY, &preferences);
     }

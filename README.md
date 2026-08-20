@@ -98,12 +98,13 @@ Save frequently used searches and facet combinations as bookmarks from the bar a
 - Select a row to inspect the complete structured event.
 - Pause and resume live following at any time.
 - Place the latest record at the top or bottom of the table.
+- Set **Keep latest** to cap the in-memory view. Committing a new limit reloads the open logs immediately so the newest window is filled without waiting for another event. Pruning pauses while you are scrolled away from the latest record so the older rows remain stable, then catches up when you return to the latest edge. Source log files are never changed.
 
 Manual vertical scrolling pauses automatic following until the latest edge is reached again. Horizontal scrolling does not interrupt vertical following. Column order, widths, panel sizes, bookmarks, message wrapping, colors, and tail preferences are restored automatically on the next launch.
 
 ### Workspaces and export
 
-A saved TOML workspace records the open sources, filters, bookmarks, column order, color grouping, and latest-record position. Use workspaces to return to the same diagnostic setup later or share a repeatable view with another developer.
+A saved TOML workspace records the open sources, filters, bookmarks, column order, color grouping, latest-record position, and log limit. Use workspaces to return to the same diagnostic setup later or share a repeatable view with another developer.
 
 Filtered records can be exported to a new JSONL file without modifying the source logs.
 

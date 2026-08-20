@@ -86,6 +86,7 @@ pub struct EventStore {
     search_documents: Vec<Arc<str>>,
     indexes: BTreeMap<String, BTreeMap<String, RoaringBitmap>>,
     max_events: usize,
+    pruning_paused: bool,
     discarded_events: u64,
 }
 
@@ -102,6 +103,7 @@ impl EventStore {
             search_documents: Vec::with_capacity(max_events.min(16_384)),
             indexes: BTreeMap::new(),
             max_events: max_events.clamp(1, u32::MAX as usize),
+            pruning_paused: false,
             discarded_events: 0,
         }
     }
@@ -118,29 +120,71 @@ impl EventStore {
         self.discarded_events
     }
 
+    pub fn max_events(&self) -> usize {
+        self.max_events
+    }
+
+    pub fn set_max_events(&mut self, max_events: usize) {
+        self.max_events = max_events.clamp(1, u32::MAX as usize);
+        self.prune_to_limit();
+    }
+
+    pub fn set_pruning_paused(&mut self, paused: bool) {
+        self.pruning_paused = paused;
+        if !paused {
+            self.prune_to_limit();
+        }
+    }
+
     pub fn get(&self, index: usize) -> Option<&LogEvent> {
         self.events.get(index)
     }
 
     pub fn push(&mut self, event: LogEvent) {
-        if self.events.len() >= self.max_events {
-            let prune_count = (self.max_events / 10).max(1);
+        let document = search_document(&event);
+        if self.pruning_paused || self.events.len() < self.max_events {
+            let index = self.events.len() as u32;
+            self.index_event(index, &event);
+            self.search_documents.push(document);
+            self.events.push(event);
+        } else {
+            self.search_documents.push(document);
+            self.events.push(event);
+            self.prune_to_limit();
+        }
+    }
+
+    pub fn extend(&mut self, events: impl IntoIterator<Item = LogEvent>) {
+        let events: Vec<_> = events.into_iter().collect();
+        if !self.pruning_paused && self.events.len().saturating_add(events.len()) > self.max_events
+        {
+            for event in events {
+                self.search_documents.push(search_document(&event));
+                self.events.push(event);
+            }
+            self.prune_to_limit();
+        } else {
+            for event in events {
+                let index = self.events.len() as u32;
+                self.index_event(index, &event);
+                self.search_documents.push(search_document(&event));
+                self.events.push(event);
+            }
+        }
+    }
+
+    fn prune_to_limit(&mut self) -> usize {
+        if self.pruning_paused {
+            return 0;
+        }
+        let prune_count = self.events.len().saturating_sub(self.max_events);
+        if prune_count > 0 {
             self.events.drain(..prune_count);
             self.search_documents.drain(..prune_count);
             self.discarded_events += prune_count as u64;
             self.rebuild_indexes();
         }
-
-        let index = self.events.len() as u32;
-        self.index_event(index, &event);
-        self.search_documents.push(search_document(&event));
-        self.events.push(event);
-    }
-
-    pub fn extend(&mut self, events: impl IntoIterator<Item = LogEvent>) {
-        for event in events {
-            self.push(event);
-        }
+        prune_count
     }
 
     pub fn facet_names(&self) -> impl Iterator<Item = &str> {
@@ -597,6 +641,78 @@ mod tests {
             store.facet_counts("source", &FilterState::default()).len(),
             3
         );
+    }
+
+    #[test]
+    fn changing_limit_prunes_immediately_and_keeps_the_newest_events() {
+        let mut store = EventStore::new(5);
+        store.extend([
+            event(Level::Info, "one", "test", "one"),
+            event(Level::Info, "two", "test", "two"),
+            event(Level::Info, "three", "test", "three"),
+            event(Level::Info, "four", "test", "four"),
+            event(Level::Info, "five", "test", "five"),
+        ]);
+
+        store.set_max_events(2);
+
+        assert_eq!(store.max_events(), 2);
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.discarded_events(), 3);
+        assert_eq!(store.get(0).unwrap().source, "four");
+        assert_eq!(store.get(1).unwrap().source, "five");
+        assert_eq!(
+            store.facet_counts("source", &FilterState::default()),
+            vec![("five".into(), 1), ("four".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn extending_past_limit_keeps_exactly_the_latest_window() {
+        let mut store = EventStore::new(3);
+        store.extend([
+            event(Level::Info, "one", "test", "one"),
+            event(Level::Info, "two", "test", "two"),
+            event(Level::Info, "three", "test", "three"),
+            event(Level::Info, "four", "test", "four"),
+            event(Level::Info, "five", "test", "five"),
+        ]);
+
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.discarded_events(), 2);
+        assert_eq!(store.get(0).unwrap().source, "three");
+        assert_eq!(store.get(2).unwrap().source, "five");
+    }
+
+    #[test]
+    fn paused_pruning_keeps_older_rows_stable_until_resumed() {
+        let mut store = EventStore::new(3);
+        store.extend([
+            event(Level::Info, "one", "test", "one"),
+            event(Level::Info, "two", "test", "two"),
+            event(Level::Info, "three", "test", "three"),
+        ]);
+
+        store.set_pruning_paused(true);
+        store.extend([
+            event(Level::Info, "four", "test", "four"),
+            event(Level::Info, "five", "test", "five"),
+        ]);
+
+        assert_eq!(store.len(), 5);
+        assert_eq!(store.discarded_events(), 0);
+        assert_eq!(store.get(0).unwrap().source, "one");
+        assert_eq!(
+            store.facet_counts("source", &FilterState::default()).len(),
+            5
+        );
+
+        store.set_pruning_paused(false);
+
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.discarded_events(), 2);
+        assert_eq!(store.get(0).unwrap().source, "three");
+        assert_eq!(store.get(2).unwrap().source, "five");
     }
 
     #[test]

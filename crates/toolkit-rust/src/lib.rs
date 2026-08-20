@@ -190,8 +190,12 @@ fn writer_loop(receiver: Receiver<WriterMessage>, mut writer: RotatingWriter) {
             Ok(WriterMessage::Event(event)) => pending.push(*event),
             Ok(WriterMessage::Shutdown) => {
                 let _ = drain_available(&receiver, &mut pending);
-                let _ = writer.write_batch(&pending);
-                let _ = writer.flush();
+                if let Err(error) = writer.write_batch(&pending) {
+                    report_writer_error("write final log batch", &error);
+                }
+                if let Err(error) = writer.flush() {
+                    report_writer_error("flush log file during shutdown", &error);
+                }
                 return;
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -199,14 +203,22 @@ fn writer_loop(receiver: Receiver<WriterMessage>, mut writer: RotatingWriter) {
         }
         let shutting_down = drain_available(&receiver, &mut pending);
         if !pending.is_empty() {
-            let _ = writer.write_batch(&pending);
+            if let Err(error) = writer.write_batch(&pending) {
+                report_writer_error("write log batch", &error);
+            }
             pending.clear();
         }
         if shutting_down {
-            let _ = writer.flush();
+            if let Err(error) = writer.flush() {
+                report_writer_error("flush log file during shutdown", &error);
+            }
             return;
         }
     }
+}
+
+fn report_writer_error(operation: &str, error: &std::io::Error) {
+    eprintln!("DeeBugee failed to {operation}: {error}");
 }
 
 fn drain_available(receiver: &Receiver<WriterMessage>, pending: &mut Vec<LogEvent>) -> bool {

@@ -73,16 +73,18 @@ impl FromStr for Level {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogEvent {
-    #[serde(default = "schema_version")]
+    #[serde(deserialize_with = "deserialize_schema_version")]
     pub schema_version: u16,
     #[serde(with = "timestamp_serde")]
     pub timestamp: DateTime<Utc>,
-    #[serde(default)]
     pub level: Level,
+    #[serde(deserialize_with = "deserialize_non_empty_string")]
     pub source: String,
+    #[serde(deserialize_with = "deserialize_non_empty_string")]
     pub subsystem: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    #[serde(deserialize_with = "deserialize_non_empty_string")]
     pub event: String,
     pub message: String,
     #[serde(deserialize_with = "deserialize_stringish")]
@@ -107,7 +109,11 @@ pub struct LogEvent {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_negative_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub duration_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
@@ -233,8 +239,18 @@ pub fn scalar_text(value: &Value) -> Option<String> {
     }
 }
 
-const fn schema_version() -> u16 {
-    SCHEMA_VERSION
+fn deserialize_schema_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u16::deserialize(deserializer)?;
+    if version == SCHEMA_VERSION {
+        Ok(version)
+    } else {
+        Err(D::Error::custom(format!(
+            "unsupported schema version {version}; expected {SCHEMA_VERSION}"
+        )))
+    }
 }
 
 fn deserialize_stringish<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -242,7 +258,8 @@ where
     D: Deserializer<'de>,
 {
     stringish(Value::deserialize(deserializer)?)
-        .ok_or_else(|| D::Error::custom("expected a string, number, or boolean identifier"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| D::Error::custom("expected a non-empty string or number identifier"))
 }
 
 fn deserialize_optional_stringish<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -252,9 +269,8 @@ where
     let value = Option::<Value>::deserialize(deserializer)?;
     value
         .map(|value| {
-            stringish(value).ok_or_else(|| {
-                D::Error::custom("expected a string, number, boolean, or null identifier")
-            })
+            stringish(value)
+                .ok_or_else(|| D::Error::custom("expected a string, number, or null identifier"))
         })
         .transpose()
 }
@@ -263,8 +279,31 @@ fn stringish(value: Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value),
         Value::Number(value) => Some(value.to_string()),
-        Value::Bool(value) => Some(value.to_string()),
-        Value::Null | Value::Array(_) | Value::Object(_) => None,
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+fn deserialize_non_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        Err(D::Error::custom("expected a non-empty string"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn deserialize_optional_non_negative_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    if value.is_some_and(|value| value < 0.0 || !value.is_finite()) {
+        Err(D::Error::custom("expected a non-negative finite number"))
+    } else {
+        Ok(value)
     }
 }
 
@@ -288,13 +327,9 @@ mod timestamp_serde {
                 .as_i64()
                 .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
             Value::String(text) => {
-                if let Ok(milliseconds) = text.parse::<i64>() {
-                    Some(milliseconds)
-                } else {
-                    return DateTime::parse_from_rfc3339(&text)
-                        .map(|timestamp| timestamp.with_timezone(&Utc))
-                        .map_err(D::Error::custom);
-                }
+                return DateTime::parse_from_rfc3339(&text)
+                    .map(|timestamp| timestamp.with_timezone(&Utc))
+                    .map_err(D::Error::custom);
             }
             _ => None,
         }
@@ -369,6 +404,7 @@ mod tests {
     #[test]
     fn also_reads_rfc3339_timestamp_for_adapter_compatibility() {
         let raw = r#"{
+            "schema_version": 1,
             "timestamp": "2026-08-16T12:00:00.000Z",
             "level": "info",
             "source": "app",
@@ -379,6 +415,49 @@ mod tests {
         }"#;
         let event: LogEvent = serde_json::from_str(raw).unwrap();
         assert_eq!(event.timestamp_text(), "2026-08-16T12:00:00.000Z");
+    }
+
+    #[test]
+    fn rejects_missing_or_unsupported_schema_contract_fields() {
+        let missing_version = r#"{
+            "timestamp": 1786882449672,
+            "level": "info",
+            "source": "app",
+            "subsystem": "startup",
+            "event": "app.started",
+            "message": "started",
+            "app_session_id": "app-1"
+        }"#;
+        assert!(serde_json::from_str::<LogEvent>(missing_version).is_err());
+
+        let missing_level = missing_version.replace(
+            "\"timestamp\": 1786882449672,",
+            "\"schema_version\": 1, \"timestamp\": 1786882449672,",
+        );
+        let missing_level = missing_level.replace("\"level\": \"info\",", "");
+        assert!(serde_json::from_str::<LogEvent>(&missing_level).is_err());
+
+        let unsupported_version = missing_version.replace(
+            "\"timestamp\": 1786882449672,",
+            "\"schema_version\": 2, \"timestamp\": 1786882449672,",
+        );
+        assert!(serde_json::from_str::<LogEvent>(&unsupported_version).is_err());
+
+        let valid_v1 = missing_version.replace(
+            "\"timestamp\": 1786882449672,",
+            "\"schema_version\": 1, \"timestamp\": 1786882449672,",
+        );
+        let boolean_identifier = valid_v1.replace("\"app-1\"", "true");
+        assert!(serde_json::from_str::<LogEvent>(&boolean_identifier).is_err());
+
+        let empty_source = valid_v1.replace("\"source\": \"app\"", "\"source\": \"\"");
+        assert!(serde_json::from_str::<LogEvent>(&empty_source).is_err());
+
+        let negative_duration = valid_v1.replace(
+            "\"app_session_id\":",
+            "\"duration_ms\": -1, \"app_session_id\":",
+        );
+        assert!(serde_json::from_str::<LogEvent>(&negative_duration).is_err());
     }
 
     #[test]

@@ -37,21 +37,32 @@ export class ElectronJsonlWriter {
     const supplied = Array.isArray(input) ? input : [];
     const entries = supplied.slice(0, this.maximumBatchEvents);
     this.rejectedEvents += supplied.length - entries.length;
-    const valid = entries.filter(isLogEvent);
-    this.rejectedEvents += entries.length - valid.length;
+    const valid: Array<{ event: LogEventV1; line: string }> = [];
+    for (const entry of entries) {
+      if (!isLogEvent(entry)) {
+        this.rejectedEvents += 1;
+        continue;
+      }
+      const line = serializeEvent(entry);
+      if (line === undefined) {
+        this.rejectedEvents += 1;
+        continue;
+      }
+      valid.push({ event: entry, line });
+    }
 
-    let payload = valid.map((event) => JSON.stringify(event)).join("\n");
+    let payload = valid.map(({ line }) => line).join("\n");
     if (payload.length > 0) payload += "\n";
     if (Buffer.byteLength(payload) > this.maximumBatchBytes) {
       this.rejectedEvents += valid.length;
       return Promise.resolve();
     }
 
-    this.pending = this.pending.then(async () => {
+    const operation = this.pending.then(async () => {
       await mkdir(dirname(this.path), { recursive: true });
       if (this.rejectedEvents > 0) {
         const rejected = this.rejectedEvents;
-        const template = valid.at(-1);
+        const template = valid.at(-1)?.event;
         if (template) {
           this.rejectedEvents = 0;
           const overflow: LogEventV1 = {
@@ -72,7 +83,8 @@ export class ElectronJsonlWriter {
       await this.rotateIfNeeded(Buffer.byteLength(payload));
       await appendFile(this.path, payload, "utf8");
     });
-    return this.pending;
+    this.pending = operation.catch(() => undefined);
+    return operation;
   }
 
   flush(): Promise<void> {
@@ -106,7 +118,31 @@ export function installElectronLogging(
 ): ElectronJsonlWriter {
   const writer = new ElectronJsonlWriter(path, options);
   ipcMain.on(ELECTRON_LOG_CHANNEL, (_event, entries) => {
-    void writer.writeBatch(entries);
+    void writer.writeBatch(entries).catch((error: unknown) => {
+      console.error("[DeeBugee] Unable to write renderer log batch", error);
+    });
   });
   return writer;
+}
+
+function serializeEvent(event: LogEventV1): string | undefined {
+  const seen = new WeakSet<object>();
+  try {
+    return JSON.stringify(event, (key, value: unknown) => {
+      if (/token|secret|api.?key|authorization|cookie|passkey|signature|magnet/i.test(key)) {
+        return "[REDACTED]";
+      }
+      if (typeof value === "bigint") return value.toString();
+      if (value instanceof Error) {
+        return { name: value.name, message: value.message, stack: value.stack };
+      }
+      if (value && typeof value === "object") {
+        if (seen.has(value)) return "[Circular]";
+        seen.add(value);
+      }
+      return value;
+    });
+  } catch {
+    return undefined;
+  }
 }
