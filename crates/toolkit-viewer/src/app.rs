@@ -1202,6 +1202,11 @@ impl ViewerApp {
         self.replace_paths(paths);
     }
 
+    fn new_log_set(&mut self) {
+        self.replace_paths(Vec::new());
+        self.last_notice = Some("Cleared loaded logs. Open a JSONL file to begin.".to_string());
+    }
+
     fn open_workspace(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Toolkit workspace", &["toml"])
@@ -1318,6 +1323,16 @@ impl ViewerApp {
             .frame(toolbar_frame)
             .show(root, |ui| {
                 ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.sources.is_empty() || !self.store.is_empty(),
+                            egui::Button::new("New"),
+                        )
+                        .on_hover_text("Clear the loaded logs and start with a new JSONL file")
+                        .clicked()
+                    {
+                        self.new_log_set();
+                    }
                     if ui.button("Open Logs").clicked()
                         && let Some(paths) = rfd::FileDialog::new()
                             .add_filter("JSON Lines", &["jsonl", "log"])

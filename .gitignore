@@ -7,3 +7,4 @@ dist/
 *.suo
 .idea/
 .vscode/
+BUILD.bat

@@ -1,100 +1,81 @@
 # DeeBugee
 
-DeeBugee is a fast, native structured-log viewer for Windows. It follows JSONL log files in real time and turns large event streams into a searchable, filterable workspace that stays responsive during active development and production diagnostics.
+**Native structured-log debugging for Windows.**
 
-The viewer is built with Rust, `egui`, and `wgpu`. Logs remain on the local machine: DeeBugee does not require a browser, WebView, HTTP server, or listening port.
+Live-tail JSONL logs, search large event streams, filter structured fields, trace correlated events, and save reusable debugging workspaces.
+
+DeeBugee is built with Rust, `egui`, and `wgpu`. It reads log files directly on your machine—no browser, WebView, HTTP server, database, cloud service, or listening port is required.
+
+![DeeBugee showing live structured logs, filters, tags, and correlated events](examples/DeeBugee.png)
+
+## Why DeeBugee?
+
+Text logs become difficult to navigate when an application has multiple processes, subsystems, requests, and concurrent tasks. DeeBugee treats each JSONL line as a structured event, so you can find, filter, group, and inspect related activity without deploying a logging service or sending data elsewhere.
+
+```text
+Application → JSONL files → DeeBugee
+                              ├─ Live tail
+                              ├─ Search and facets
+                              ├─ Correlation filtering
+                              └─ Complete event details
+```
 
 ## Highlights
 
-- Follow one or more append-only JSONL files in real time.
-- Open files from the picker, command line, or drag and drop.
-- Search messages and structured fields with fuzzy, multi-term matching.
-- Filter by level, source, feature tag, subsystem, target, event, provider, status, correlation, and custom scalar fields.
-- Keep up to 250,000 recent records in a bounded in-memory window.
-- Reorder and resize columns, wrap messages, and inspect complete event details.
-- Save filter bookmarks and reusable TOML workspaces.
-- Color related events by source, feature tag, subsystem, target, event, provider, or correlation.
-- Pause live following, choose whether the newest event appears at the top or bottom, and export filtered results.
-- Preserve layout and viewing preferences automatically between launches.
-- Produce compatible logs with the included Rust, Electron, and .NET adapters.
+- **Live tailing** — follow one or more append-only JSONL files in real time.
+- **Structured filtering** — filter by level, source, feature tag, subsystem, event, correlation, and custom scalar fields.
+- **Fast search** — fuzzy, multi-term search across messages and structured event data.
+- **Large histories** — keep a responsive bounded view of up to 250,000 recent records.
+- **Reusable debugging sessions** — save bookmarks, layouts, and TOML workspaces.
+- **Native integrations** — produce compatible logs from Rust/Tauri, Electron, and .NET applications.
 
-## Quick start
+## Try it
 
-### Requirements
+### Windows portable executable
 
-- Windows 10 or Windows 11
-- A current stable Rust toolchain with Cargo
+Download the [latest portable DeeBugee executable](https://github.com/JustApeasantCoder/DeeBugee/releases/latest), then run `dee-bugee.exe`. No installer or Rust toolchain is required. Open a JSONL file from the picker, drag one onto the window, or pass its path on the command line:
 
-Node.js/npm and the .NET 8 SDK are only required when building their respective adapters or examples.
+```powershell
+.\dee-bugee.exe "C:\Logs\Application.jsonl"
+```
 
-### Clone and build
+### Build from source
+
+Building from source requires Windows 10 or Windows 11 and a current stable Rust toolchain with Cargo. Clone, build, and open the included sample log:
 
 ```powershell
 git clone https://github.com/JustApeasantCoder/DeeBugee.git
 cd DeeBugee
-.\BUILD.bat
+cargo run --release -p dee-bugee -- .\tests\fixtures\sample.jsonl
 ```
 
-`BUILD.bat` is the canonical release build. It increments the patch version before compiling (for example, `1.0.1` becomes `1.0.2`) and keeps the Rust workspace, Electron adapter, and .NET package on the same version. Commit the resulting version-file changes with the build you release.
+This opens a representative structured log so you can immediately try search, facets, bookmarks, live-follow controls, and event inspection.
 
-### Development with automatic reload
-
-Use `RUN.bat` for local development:
-
-```powershell
-.\RUN.bat "C:\Logs\Application.jsonl"
-```
-
-It runs the debug build through the included development watcher. Saving Rust source changes recompiles and restarts the native viewer; this is the native-app equivalent of Vite hot reload. `RUN.bat` never changes the application version. Stop the reload loop with `Ctrl+C`.
-
-The release executable is created at:
+The built executable can run on Windows without Rust installed:
 
 ```text
 target\release\dee-bugee.exe
 ```
 
-You can also build directly with Cargo:
+To open your own JSONL file after building:
 
 ```powershell
-cargo build --release -p dee-bugee
+.\target\release\dee-bugee.exe "C:\Logs\Application.jsonl"
 ```
 
-### Open a log file
+You can also launch without a path to start with an empty workspace. Use **Open JSONL** to select files, drag files onto the window, or open a previously saved workspace. Multiple files can be followed at the same time.
 
-Pass a JSONL file when launching DeeBugee:
-
-```powershell
-.\RUN.bat "C:\Logs\Application.jsonl"
-```
-
-Or run it directly through Cargo:
-
-```powershell
-cargo run --release -p dee-bugee -- "C:\Logs\Application.jsonl"
-```
-
-Launch without a path to start with an empty workspace:
-
-```powershell
-.\RUN.bat
-```
-
-Use **Open JSONL** to select files, drag files onto the window, or open a previously saved workspace. Multiple files can be followed at the same time.
-
-## Using the viewer
+## Using DeeBugee
 
 ### Search and filtering
 
 Search terms use AND semantics across messages, event names, sources, subsystems, correlation values, optional schema properties, and structured `fields`. Terms do not need to be adjacent, and small typing mistakes are tolerated.
 
-Facet controls provide fast structured filtering:
+Facet controls provide fast structured filtering. Feature tags are derived consistently from bracketed message prefixes and subsystem names. Context prefixes such as `Settings`, `Frontend`, `Backend`, `Local`, and `Remote` do not replace the underlying feature, so `[Segment Detection][Local]` and `[Settings][WhisperLive]` remain grouped under `Segment Detection` and `WhisperLive` respectively.
 
-Feature tags are derived consistently from bracketed message prefixes and subsystem names. Context prefixes such as `Settings`, `Frontend`, `Backend`, `Local`, and `Remote` do not replace the underlying feature, so `[Segment Detection][Local]` and `[Settings][WhisperLive]` remain grouped under `Segment Detection` and `WhisperLive` respectively.
-
-- Left-click a value to include only that value in its facet.
+- Left-click a value to include it in its facet.
 - Ctrl+left-click additional values to combine them with OR semantics.
 - Right-click a value to exclude it.
-- Click an exclusive value again to return it to neutral.
 - Filters from different facets combine with AND semantics.
 - Use the minimum-level selector to hide lower-severity events.
 
@@ -102,58 +83,67 @@ Save frequently used searches and facet combinations as bookmarks from the bar a
 
 ### Table and live-follow controls
 
-- Drag column headers to reorder them.
-- Drag column edges to resize them.
-- Use the horizontal scrollbar when the table is wider than the window.
-- Hold the middle mouse button over the table and drag to pan vertically or horizontally.
-- Switch between compact and wrapped messages.
-- Select a row to inspect the complete structured event.
-- Pause and resume live following at any time.
-- Place the latest record at the top or bottom of the table.
-- Set **Keep latest** to cap the in-memory view. Committing a new limit reloads the open logs immediately so the newest window is filled without waiting for another event. Pruning pauses while you are scrolled away from the latest record so the older rows remain stable, then catches up when you return to the latest edge. Source log files are never changed.
+- Drag column headers to reorder them and edges to resize them.
+- Use compact or wrapped messages, then select a row to inspect the full structured event.
+- Pause and resume live following, and place the newest record at the top or bottom.
+- Color related events by source, feature tag, subsystem, target, event, provider, or correlation.
+- Set **Keep latest** to maintain a configurable bounded window without modifying source logs. Older rows remain stable while you inspect history.
 
-Manual vertical scrolling pauses automatic following until the latest edge is reached again. Horizontal scrolling does not interrupt vertical following. Column order, widths, panel sizes, bookmarks, message wrapping, colors, and tail preferences are restored automatically on the next launch.
+Manual vertical scrolling pauses automatic following until you return to the latest edge. Horizontal scrolling does not interrupt vertical following. Layout, panel sizes, bookmarks, message wrapping, colors, and tail preferences are restored between launches.
 
 ### Workspaces and export
 
 A saved TOML workspace records the open sources, filters, bookmarks, column order, color grouping, latest-record position, and log limit. Use workspaces to return to the same diagnostic setup later or share a repeatable view with another developer.
 
-Filtered records can be exported to a new JSONL file without modifying the source logs.
+Filtered records can be exported to a new JSONL file without modifying source logs.
 
 ## JSONL event format
 
-DeeBugee reads one JSON object per line. Each event must contain the following fields:
+DeeBugee reads one JSON object per line. Each event must contain `schema_version`, `timestamp`, `level`, `source`, `subsystem`, `event`, `message`, and `app_session_id`.
 
-- `schema_version`
-- `timestamp`
-- `level`
-- `source`
-- `subsystem`
-- `event`
-- `message`
-- `app_session_id`
-
-Example:
+For readability, this is shown as formatted JSON below. In an actual `.jsonl` file, each event is serialized on one line.
 
 ```json
-{"schema_version":1,"timestamp":1787202000000,"level":"info","source":"desktop_app","subsystem":"worker","event":"job.completed","message":"Background job completed","app_session_id":"session-42","request_id":"request-108","duration_ms":36.4,"status":"ok","fields":{"items_processed":24}}
+{
+  "schema_version": 1,
+  "timestamp": 1787202000000,
+  "level": "info",
+  "source": "desktop_app",
+  "subsystem": "worker",
+  "event": "job.completed",
+  "message": "Background job completed",
+  "app_session_id": "session-42",
+  "request_id": "request-108",
+  "duration_ms": 36.4,
+  "status": "ok",
+  "fields": {
+    "items_processed": 24
+  }
+}
 ```
 
 Supported levels are `trace`, `debug`, `info`, `warn`, `error`, and `fatal`. Timestamps may be Unix epoch milliseconds or RFC 3339 text. Additional properties are accepted, and scalar values inside `fields` automatically become filterable facets.
 
+### Tags
+
+`tag` is a viewer-derived facet, not a required JSONL property. DeeBugee derives it from the first meaningful bracketed message prefix, then falls back to `subsystem`. Context prefixes such as `Settings`, `Frontend`, `Backend`, `Local`, and `Remote` are ignored when a more specific feature follows them. For example, `[Search][Local] Results refreshed` is grouped under `Search`, while `[Settings][WhisperLive] Enabled` is grouped under `WhisperLive`.
+
+You do not need to write a `tag` property. Use a consistent bracketed feature prefix in `message` when you want explicit grouping; the built-in Tag facet then keeps related frontend and backend events together automatically.
+
 The complete contract is defined in [`schemas/event-v1.schema.json`](schemas/event-v1.schema.json).
 
-## Application integrations
+## Integrating DeeBugee
 
-The adapters are included in this repository and currently support local path-based integration.
+The included adapters currently support local path-based integration.
 
 ### Rust and Tauri
 
-Add the Rust adapter as a path dependency:
+Add the Rust adapter and `tracing-subscriber` as path dependencies:
 
 ```toml
 [dependencies]
 dee-bugee-rust = { path = "path/to/DeeBugee/crates/toolkit-rust" }
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 ```
 
 Install the non-blocking `tracing` layer:
@@ -192,11 +182,14 @@ npm install
 npm run build
 ```
 
-Install the writer in the main process:
+In the main process, import Electron's `ipcMain`, choose a local log path, and install the writer:
 
 ```ts
+import { app, ipcMain } from "electron";
+import { join } from "node:path";
 import { installElectronLogging } from "@deebugee/electron";
 
+const logPath = join(app.getPath("userData"), "logs", "application.jsonl");
 const writer = installElectronLogging(ipcMain, logPath);
 ```
 
@@ -211,13 +204,7 @@ const logger = createRendererLogger(ipcRenderer, {
 });
 
 logger.captureConsole();
-logger.log(
-  "info",
-  "window.ready",
-  "Main window is ready",
-  { duration_ms: 42.5 },
-  "interface",
-);
+logger.log("info", "window.ready", "Main window is ready", { duration_ms: 42.5 }, "interface");
 ```
 
 ### .NET
@@ -242,7 +229,27 @@ logger.LogInformation(
     elapsed.TotalMilliseconds);
 ```
 
-## Development and validation
+## Build from source
+
+Build the release executable from the repository root:
+
+```powershell
+cargo build --release -p dee-bugee
+```
+
+Node.js/npm and the .NET 8 SDK are only required when building their respective adapters or examples.
+
+## Development
+
+Use `RUN.bat` for local development:
+
+```powershell
+.\RUN.bat "C:\Logs\Application.jsonl"
+```
+
+It runs the debug build through the included development watcher. Saving Rust source changes recompiles and restarts the native viewer; this is the native-app equivalent of Vite hot reload. `RUN.bat` never changes the application version. Stop the reload loop with `Ctrl+C`.
+
+### Validation
 
 Run the complete Rust validation suite from the repository root:
 
