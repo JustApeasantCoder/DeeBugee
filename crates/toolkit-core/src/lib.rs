@@ -83,11 +83,13 @@ impl FilterState {
 #[derive(Debug)]
 pub struct EventStore {
     events: Vec<LogEvent>,
+    event_ids: Vec<u64>,
     search_documents: Vec<Arc<str>>,
     indexes: BTreeMap<String, BTreeMap<String, RoaringBitmap>>,
     max_events: usize,
     pruning_paused: bool,
     discarded_events: u64,
+    next_event_id: u64,
 }
 
 impl Default for EventStore {
@@ -100,11 +102,13 @@ impl EventStore {
     pub fn new(max_events: usize) -> Self {
         Self {
             events: Vec::with_capacity(max_events.min(16_384)),
+            event_ids: Vec::with_capacity(max_events.min(16_384)),
             search_documents: Vec::with_capacity(max_events.min(16_384)),
             indexes: BTreeMap::new(),
             max_events: max_events.clamp(1, u32::MAX as usize),
             pruning_paused: false,
             discarded_events: 0,
+            next_event_id: 0,
         }
     }
 
@@ -140,16 +144,24 @@ impl EventStore {
         self.events.get(index)
     }
 
+    /// A monotonic ingestion identity that survives row-index shifts caused by pruning.
+    pub fn event_id(&self, index: usize) -> Option<u64> {
+        self.event_ids.get(index).copied()
+    }
+
     pub fn push(&mut self, event: LogEvent) {
         let document = search_document(&event);
+        let event_id = self.take_next_event_id();
         if self.pruning_paused || self.events.len() < self.max_events {
             let index = self.events.len() as u32;
             self.index_event(index, &event);
             self.search_documents.push(document);
             self.events.push(event);
+            self.event_ids.push(event_id);
         } else {
             self.search_documents.push(document);
             self.events.push(event);
+            self.event_ids.push(event_id);
             self.prune_to_limit();
         }
     }
@@ -161,6 +173,8 @@ impl EventStore {
             for event in events {
                 self.search_documents.push(search_document(&event));
                 self.events.push(event);
+                let event_id = self.take_next_event_id();
+                self.event_ids.push(event_id);
             }
             self.prune_to_limit();
         } else {
@@ -169,6 +183,8 @@ impl EventStore {
                 self.index_event(index, &event);
                 self.search_documents.push(search_document(&event));
                 self.events.push(event);
+                let event_id = self.take_next_event_id();
+                self.event_ids.push(event_id);
             }
         }
     }
@@ -180,11 +196,18 @@ impl EventStore {
         let prune_count = self.events.len().saturating_sub(self.max_events);
         if prune_count > 0 {
             self.events.drain(..prune_count);
+            self.event_ids.drain(..prune_count);
             self.search_documents.drain(..prune_count);
             self.discarded_events += prune_count as u64;
             self.rebuild_indexes();
         }
         prune_count
+    }
+
+    fn take_next_event_id(&mut self) -> u64 {
+        let event_id = self.next_event_id;
+        self.next_event_id = self.next_event_id.wrapping_add(1);
+        event_id
     }
 
     pub fn facet_names(&self) -> impl Iterator<Item = &str> {
@@ -682,6 +705,19 @@ mod tests {
         assert_eq!(store.discarded_events(), 2);
         assert_eq!(store.get(0).unwrap().source, "three");
         assert_eq!(store.get(2).unwrap().source, "five");
+    }
+
+    #[test]
+    fn event_ids_remain_unique_after_pruning_shifts_indexes() {
+        let mut store = EventStore::new(2);
+        let duplicate = || event(Level::Info, "same", "same", "same");
+        store.extend([duplicate(), duplicate()]);
+        let retained_id = store.event_id(1).unwrap();
+        store.push(duplicate());
+
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.event_id(0), Some(retained_id));
+        assert!(store.event_id(1).unwrap() > retained_id);
     }
 
     #[test]

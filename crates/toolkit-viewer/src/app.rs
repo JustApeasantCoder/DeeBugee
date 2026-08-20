@@ -18,6 +18,7 @@ use dee_bugee_core::{
 use dee_bugee_schema::{Level, LogEvent};
 use eframe::egui::{
     self, Color32, FontFamily, FontId, Label, PointerButton, RichText, Sense, Stroke, TextStyle,
+    text::{LayoutJob, TextFormat},
 };
 use egui_extras::{Column, TableBuilder};
 use serde::{Deserialize, Serialize};
@@ -37,7 +38,7 @@ const DISPLAYED_FACETS: [&str; 9] = [
 ];
 const PREFERENCES_KEY: &str = "dee_bugee.viewer_preferences.v1";
 const TAIL_HEADROOM_ROWS: f32 = 2.5;
-const TAIL_SETTLE_FRAMES: u8 = 2;
+const LATEST_SETTLE_FRAMES: u8 = 2;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 const MAX_CONFIGURABLE_EVENTS: usize = 5_000_000;
 
@@ -52,6 +53,170 @@ const ACCENT_SOFT: Color32 = Color32::from_rgb(34, 53, 91);
 const SUCCESS: Color32 = Color32::from_rgb(87, 205, 148);
 const WARNING: Color32 = Color32::from_rgb(240, 184, 82);
 const DANGER: Color32 = Color32::from_rgb(242, 108, 122);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageTone {
+    Positive,
+    Negative,
+    Warning,
+    Activity,
+}
+
+impl MessageTone {
+    const fn color(self) -> Color32 {
+        match self {
+            Self::Positive => SUCCESS,
+            Self::Negative => DANGER,
+            Self::Warning => WARNING,
+            Self::Activity => ACCENT,
+        }
+    }
+}
+
+// Longer phrases deliberately come first. This prevents a positive substring such as
+// "found" from winning inside a negative status such as "not found".
+const MESSAGE_HIGHLIGHTS: &[(MessageTone, &str)] = &[
+    (MessageTone::Negative, "not found"),
+    (MessageTone::Negative, "not configured"),
+    (MessageTone::Negative, "not initialized"),
+    (MessageTone::Negative, "not connected"),
+    (MessageTone::Negative, "not ready"),
+    (MessageTone::Negative, "not authorized"),
+    (MessageTone::Negative, "not supported"),
+    (MessageTone::Negative, "not implemented"),
+    (MessageTone::Negative, "no results"),
+    (MessageTone::Negative, "no response"),
+    (MessageTone::Negative, "no data"),
+    (MessageTone::Negative, "no connection"),
+    (MessageTone::Negative, "no match"),
+    (MessageTone::Negative, "not available"),
+    (MessageTone::Negative, "access denied"),
+    (MessageTone::Negative, "permission denied"),
+    (MessageTone::Negative, "connection refused"),
+    (MessageTone::Negative, "connection failed"),
+    (MessageTone::Negative, "network error"),
+    (MessageTone::Negative, "request failed"),
+    (MessageTone::Negative, "operation failed"),
+    (MessageTone::Negative, "validation failed"),
+    (MessageTone::Negative, "authentication failed"),
+    (MessageTone::Negative, "authentication required"),
+    (MessageTone::Negative, "service unavailable"),
+    (MessageTone::Negative, "out of memory"),
+    (MessageTone::Negative, "out of space"),
+    (MessageTone::Negative, "timed out"),
+    (MessageTone::Negative, "could not"),
+    (MessageTone::Negative, "unable to"),
+    (MessageTone::Negative, "failed"),
+    (MessageTone::Negative, "failure"),
+    (MessageTone::Negative, "error"),
+    (MessageTone::Negative, "fatal"),
+    (MessageTone::Negative, "exception"),
+    (MessageTone::Negative, "panic"),
+    (MessageTone::Negative, "crashed"),
+    (MessageTone::Negative, "aborted"),
+    (MessageTone::Negative, "cancelled"),
+    (MessageTone::Negative, "canceled"),
+    (MessageTone::Negative, "denied"),
+    (MessageTone::Negative, "forbidden"),
+    (MessageTone::Negative, "unauthorized"),
+    (MessageTone::Negative, "rejected"),
+    (MessageTone::Negative, "invalid"),
+    (MessageTone::Negative, "missing"),
+    (MessageTone::Negative, "unavailable"),
+    (MessageTone::Negative, "disconnected"),
+    (MessageTone::Negative, "offline"),
+    (MessageTone::Negative, "corrupted"),
+    (MessageTone::Negative, "mismatch"),
+    (MessageTone::Negative, "blocked"),
+    (MessageTone::Negative, "exceeded"),
+    (MessageTone::Negative, "expired"),
+    (MessageTone::Negative, "timeout"),
+    (MessageTone::Negative, "unsupported"),
+    (MessageTone::Negative, "unreachable"),
+    (MessageTone::Negative, "overloaded"),
+    (MessageTone::Negative, "malformed"),
+    (MessageTone::Negative, "duplicate"),
+    (MessageTone::Warning, "warning"),
+    (MessageTone::Warning, "warn"),
+    (MessageTone::Warning, "retrying"),
+    (MessageTone::Warning, "retry"),
+    (MessageTone::Warning, "delayed"),
+    (MessageTone::Warning, "pending"),
+    (MessageTone::Warning, "partial"),
+    (MessageTone::Warning, "skipped"),
+    (MessageTone::Warning, "deprecated"),
+    (MessageTone::Warning, "rate limited"),
+    (MessageTone::Warning, "throttled"),
+    (MessageTone::Warning, "in progress"),
+    (MessageTone::Warning, "waiting"),
+    (MessageTone::Warning, "paused"),
+    (MessageTone::Warning, "degraded"),
+    (MessageTone::Warning, "limited"),
+    (MessageTone::Warning, "fallback"),
+    (MessageTone::Warning, "ignored"),
+    (MessageTone::Warning, "unchanged"),
+    (MessageTone::Warning, "slow"),
+    (MessageTone::Positive, "successfully"),
+    (MessageTone::Positive, "successful"),
+    (MessageTone::Positive, "succeeded"),
+    (MessageTone::Positive, "completed"),
+    (MessageTone::Positive, "complete"),
+    (MessageTone::Positive, "connected"),
+    (MessageTone::Positive, "available"),
+    (MessageTone::Positive, "validated"),
+    (MessageTone::Positive, "verified"),
+    (MessageTone::Positive, "detected"),
+    (MessageTone::Positive, "resolved"),
+    (MessageTone::Positive, "recovered"),
+    (MessageTone::Positive, "accepted"),
+    (MessageTone::Positive, "authorized"),
+    (MessageTone::Positive, "enabled"),
+    (MessageTone::Positive, "ready"),
+    (MessageTone::Positive, "healthy"),
+    (MessageTone::Positive, "initialized"),
+    (MessageTone::Positive, "configured"),
+    (MessageTone::Positive, "registered"),
+    (MessageTone::Positive, "synchronized"),
+    (MessageTone::Positive, "synced"),
+    (MessageTone::Positive, "imported"),
+    (MessageTone::Positive, "exported"),
+    (MessageTone::Positive, "uploaded"),
+    (MessageTone::Positive, "downloaded"),
+    (MessageTone::Positive, "installed"),
+    (MessageTone::Positive, "cleared"),
+    (MessageTone::Positive, "removed"),
+    (MessageTone::Positive, "released"),
+    (MessageTone::Positive, "found"),
+    (MessageTone::Positive, "success"),
+    (MessageTone::Positive, "passed"),
+    (MessageTone::Positive, "done"),
+    (MessageTone::Positive, "created"),
+    (MessageTone::Positive, "saved"),
+    (MessageTone::Positive, "loaded"),
+    (MessageTone::Positive, "started"),
+    (MessageTone::Activity, "triggered"),
+    (MessageTone::Activity, "trigger"),
+    (MessageTone::Activity, "attempting"),
+    (MessageTone::Activity, "initiated"),
+    (MessageTone::Activity, "scheduled"),
+    (MessageTone::Activity, "dispatching"),
+    (MessageTone::Activity, "dispatched"),
+    (MessageTone::Activity, "enqueued"),
+    (MessageTone::Activity, "processing"),
+    (MessageTone::Activity, "running"),
+    (MessageTone::Activity, "queued"),
+    (MessageTone::Activity, "received"),
+    (MessageTone::Activity, "sending"),
+    (MessageTone::Activity, "fetching"),
+    (MessageTone::Activity, "searching"),
+    (MessageTone::Activity, "scanning"),
+    (MessageTone::Activity, "updating"),
+    (MessageTone::Activity, "reloading"),
+    (MessageTone::Activity, "listening"),
+    (MessageTone::Activity, "watching"),
+    (MessageTone::Activity, "discovering"),
+    (MessageTone::Activity, "connecting"),
+];
 
 fn configure_ui(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -335,6 +500,7 @@ struct ViewerPreferences {
     version: u16,
     column_order: Vec<TableColumn>,
     wrapped_messages: bool,
+    semantic_highlighting: bool,
     stick_to_bottom: bool,
     color_by: ColorBy,
     bookmarks: Vec<FilterBookmark>,
@@ -348,6 +514,7 @@ impl Default for ViewerPreferences {
             version: 1,
             column_order: default_column_order(),
             wrapped_messages: true,
+            semantic_highlighting: false,
             stick_to_bottom: true,
             color_by: ColorBy::Off,
             bookmarks: Vec::new(),
@@ -363,6 +530,8 @@ struct WorkspaceConfig {
     sources: Vec<PathBuf>,
     filter: FilterState,
     wrapped_messages: bool,
+    #[serde(default)]
+    semantic_highlighting: bool,
     stick_to_bottom: bool,
     #[serde(default)]
     color_by: ColorBy,
@@ -485,6 +654,7 @@ pub struct ViewerApp {
     paused: bool,
     filters_dirty: bool,
     wrapped_messages: bool,
+    semantic_highlighting: bool,
     stick_to_bottom: bool,
     color_by: ColorBy,
     bookmarks: Vec<FilterBookmark>,
@@ -538,6 +708,7 @@ impl ViewerApp {
             paused: false,
             filters_dirty: true,
             wrapped_messages: preferences.wrapped_messages,
+            semantic_highlighting: preferences.semantic_highlighting,
             stick_to_bottom: preferences.stick_to_bottom,
             color_by: preferences.color_by,
             bookmarks: preferences.bookmarks,
@@ -546,7 +717,7 @@ impl ViewerApp {
             middle_pan_active: false,
             tail_was_at_bottom: true,
             scroll_to_bottom_requested: true,
-            scroll_settle_frames: TAIL_SETTLE_FRAMES,
+            scroll_settle_frames: LATEST_SETTLE_FRAMES,
             last_discarded_events: 0,
             search_worker,
             search_generation: 0,
@@ -564,6 +735,10 @@ impl ViewerApp {
     }
 
     fn drain_reader(&mut self) {
+        let previous_latest_visible =
+            latest_visible_id(&self.store, &self.visible_rows, self.latest_at);
+        // Capture the visible tail before this can release deferred pruning. Otherwise
+        // a pruning pass can shift indexes before the change detector sees it.
         self.store.set_pruning_paused(!self.tail_was_at_bottom);
         let mut received_events = false;
         loop {
@@ -603,8 +778,23 @@ impl ViewerApp {
         }
         if received_events && !self.paused && self.tail_was_at_bottom {
             self.filters_dirty = true;
-            if self.stick_to_bottom && (self.tail_was_at_bottom || self.scroll_to_bottom_requested)
-            {
+            // A hidden record or an older-row prune must not move the log viewport.
+            // When the current filter can be evaluated synchronously, compare the
+            // visible tail before and after ingestion and follow only if the newest
+            // visible event itself changed.
+            let visible_tail_changed = can_refresh_filtered_rows_immediately(
+                !self.filter.text.trim().is_empty(),
+                self.cached_search_is_current(),
+            ) && {
+                self.refresh_filters();
+                visible_tail_changed(
+                    previous_latest_visible,
+                    &self.store,
+                    &self.visible_rows,
+                    self.latest_at,
+                )
+            };
+            if visible_tail_changed && self.stick_to_bottom {
                 self.request_scroll_to_latest();
             }
         }
@@ -612,13 +802,28 @@ impl ViewerApp {
 
     fn request_scroll_to_latest(&mut self) {
         self.scroll_to_bottom_requested = true;
-        self.scroll_settle_frames = TAIL_SETTLE_FRAMES;
+        self.scroll_settle_frames = LATEST_SETTLE_FRAMES;
     }
 
     fn filter_changed(&mut self) {
+        let was_at_latest = self.tail_was_at_bottom;
         self.filters_dirty = true;
-        self.tail_was_at_bottom = true;
-        self.request_scroll_to_latest();
+        // Facet hide/show changes are synchronous, but the table is rendered later in
+        // this same frame. Rebuild now so a concurrent Jump to latest targets the
+        // filtered row list, not the list from before the facet change. Text searches
+        // still wait for their worker result when its cache is stale.
+        if can_refresh_filtered_rows_immediately(
+            !self.filter.text.trim().is_empty(),
+            self.cached_search_is_current(),
+        ) {
+            self.refresh_filters();
+        }
+        // Filtering is a view change, not an instruction to jump. Preserve an
+        // existing latest anchor, but leave readers who are inspecting older rows
+        // exactly where they are. Jump to latest remains an explicit action.
+        if was_at_latest {
+            self.request_scroll_to_latest();
+        }
     }
 
     fn displayed_facets(&self) -> Vec<String> {
@@ -650,6 +855,11 @@ impl ViewerApp {
     }
 
     fn cached_search_is_current(&self) -> bool {
+        self.search_cache_matches_store_generation()
+            && self.text_matches_event_count == self.store.len()
+    }
+
+    fn search_cache_matches_store_generation(&self) -> bool {
         self.text_matches_query == self.filter.text
             && self.text_matches_discarded_events == self.store.discarded_events()
     }
@@ -678,8 +888,8 @@ impl ViewerApp {
             return;
         }
 
-        let can_extend =
-            self.cached_search_is_current() && self.text_matches_event_count <= self.store.len();
+        let can_extend = self.search_cache_matches_store_generation()
+            && self.text_matches_event_count <= self.store.len();
         let (mode, start_index) = if can_extend {
             (SearchMode::Incremental, self.text_matches_event_count)
         } else {
@@ -720,7 +930,7 @@ impl ViewerApp {
             match response.mode {
                 SearchMode::Full => self.text_matches = response.matches,
                 SearchMode::Incremental
-                    if self.cached_search_is_current()
+                    if self.search_cache_matches_store_generation()
                         && self.text_matches_event_count == response.start_index =>
                 {
                     self.text_matches.extend(response.matches);
@@ -734,6 +944,20 @@ impl ViewerApp {
             self.text_matches_event_count = response.event_count;
             self.text_matches_discarded_events = response.discarded_events;
             self.filters_dirty = true;
+            if self.tail_was_at_bottom && self.cached_search_is_current() {
+                let previous_latest =
+                    latest_visible_id(&self.store, &self.visible_rows, self.latest_at);
+                self.refresh_filters();
+                if visible_tail_changed(
+                    previous_latest,
+                    &self.store,
+                    &self.visible_rows,
+                    self.latest_at,
+                ) && self.stick_to_bottom
+                {
+                    self.request_scroll_to_latest();
+                }
+            }
             if response.event_count < self.store.len() {
                 self.schedule_text_search(Duration::ZERO);
             }
@@ -825,6 +1049,7 @@ impl ViewerApp {
             Ok(workspace) if workspace.version == 1 => {
                 self.filter = workspace.filter;
                 self.wrapped_messages = workspace.wrapped_messages;
+                self.semantic_highlighting = workspace.semantic_highlighting;
                 self.stick_to_bottom = workspace.stick_to_bottom;
                 self.color_by = workspace.color_by;
                 self.bookmarks = workspace.bookmarks;
@@ -857,6 +1082,7 @@ impl ViewerApp {
             sources: self.sources.clone(),
             filter: self.filter.clone(),
             wrapped_messages: self.wrapped_messages,
+            semantic_highlighting: self.semantic_highlighting,
             stick_to_bottom: self.stick_to_bottom,
             color_by: self.color_by,
             bookmarks: self.bookmarks.clone(),
@@ -1045,10 +1271,14 @@ impl ViewerApp {
                     if ui
                         .checkbox(&mut self.stick_to_bottom, "Follow latest")
                         .changed()
-                        && self.stick_to_bottom
                     {
-                        self.tail_was_at_bottom = true;
-                        self.request_scroll_to_latest();
+                        if self.stick_to_bottom {
+                            self.tail_was_at_bottom = true;
+                            self.request_scroll_to_latest();
+                        } else {
+                            self.scroll_to_bottom_requested = false;
+                            self.scroll_settle_frames = 0;
+                        }
                     }
                     let previous_latest_at = self.latest_at;
                     egui::ComboBox::from_id_salt("latest_at")
@@ -1061,7 +1291,22 @@ impl ViewerApp {
                     if self.latest_at != previous_latest_at {
                         self.filter_changed();
                     }
-                    ui.checkbox(&mut self.wrapped_messages, "Wrap");
+                    let wrap_changed = ui.checkbox(&mut self.wrapped_messages, "Wrap").changed();
+                    if should_reanchor_after_wrap(
+                        wrap_changed,
+                        self.stick_to_bottom,
+                        self.tail_was_at_bottom,
+                        self.scroll_to_bottom_requested,
+                    ) {
+                        // Wrapping changes the virtual height of every message row. Preserve
+                        // the current latest anchor instead of retaining an offset calculated
+                        // for the old layout.
+                        self.request_scroll_to_latest();
+                    }
+                    ui.checkbox(&mut self.semantic_highlighting, "Highlight terms")
+                        .on_hover_text(
+                            "Color positive, negative, warning, and activity phrases in log messages",
+                        );
                     egui::ComboBox::from_id_salt("color_by")
                         .selected_text(format!("Color: {}", self.color_by.title()))
                         .show_ui(ui, |ui| {
@@ -1333,6 +1578,7 @@ impl ViewerApp {
         else {
             return;
         };
+        let semantic_highlighting = self.semantic_highlighting;
 
         egui::Panel::bottom("details")
             .resizable(true)
@@ -1375,7 +1621,16 @@ impl ViewerApp {
                 });
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.label(RichText::new(&event.message).strong().size(15.0));
+                    if semantic_highlighting {
+                        let mut message =
+                            highlighted_message(&event.message, ui.visuals().text_color());
+                        for section in &mut message.sections {
+                            section.format.font_id = FontId::proportional(15.0);
+                        }
+                        ui.add(Label::new(message));
+                    } else {
+                        ui.label(RichText::new(&event.message).strong().size(15.0));
+                    }
                     ui.separator();
                     let mut raw = serde_json::to_string_pretty(&event)
                         .unwrap_or_else(|error| format!("Unable to serialize event: {error}"));
@@ -1417,16 +1672,20 @@ impl ViewerApp {
             self.bookmark_bar(ui);
 
             let row_height = ui.text_style_height(&TextStyle::Body) + 8.0;
-            let manual_wheel_scroll = ui.rect_contains_pointer(ui.max_rect())
-                && ui.input(|input| input.smooth_scroll_delta.y.abs() > f32::EPSILON);
+            // Capture this before the nested table consumes it. We apply it only after
+            // knowing the pointer is over the table and only when it moves away from
+            // the latest edge; a wheel attempt at the edge must not disable following.
+            let (pointer_position, vertical_scroll_delta) = ui.input(|input| {
+                (input.pointer.interact_pos(), input.smooth_scroll_delta.y)
+            });
             let column_order = self.column_order.clone();
             let visible_rows = &self.visible_rows;
             let store = &self.store;
             let wrapped = self.wrapped_messages;
+            let semantic_highlighting = self.semantic_highlighting;
             let color_by = self.color_by;
             let latest_at = self.latest_at;
-            let scroll_to_bottom_requested =
-                self.scroll_to_bottom_requested && !manual_wheel_scroll;
+            let scroll_to_bottom_requested = self.scroll_to_bottom_requested;
             let mut selected = self.selected_row;
             let mut requested_move = None;
             let table_content_width = ui.available_width().max(1_400.0);
@@ -1444,11 +1703,15 @@ impl ViewerApp {
                     for column in &column_order {
                         table = table.column(column.layout());
                     }
-                    if scroll_to_bottom_requested
-                        && !visible_rows.is_empty()
-                        && latest_at == LatestAt::Top
-                    {
-                        table = table.vertical_scroll_offset(0.0).animate_scrolling(false);
+                    if scroll_to_bottom_requested && !visible_rows.is_empty() {
+                        table = match latest_at {
+                            LatestAt::Top => table.vertical_scroll_offset(0.0),
+                            // The final spacer row supplies deliberate breathing room below the
+                            // newest record, so it is the true latest scroll target.
+                            LatestAt::Bottom => table
+                                .scroll_to_row(visible_rows.len(), Some(egui::Align::BOTTOM)),
+                        }
+                        .animate_scrolling(false);
                     }
 
                     table
@@ -1579,7 +1842,13 @@ impl ViewerApp {
                                         if let Some(color) = row_color {
                                             ui.visuals_mut().override_text_color = Some(color);
                                         }
-                                        show_event_cell(ui, *column, event, wrapped);
+                                        show_event_cell(
+                                            ui,
+                                            *column,
+                                            event,
+                                            wrapped,
+                                            semantic_highlighting,
+                                        );
                                     });
                                 }
                                 if row.response().clicked() {
@@ -1589,17 +1858,18 @@ impl ViewerApp {
                         })
                 });
 
-            let (middle_pressed, middle_down, pointer_position, pointer_delta) =
+            let (middle_pressed, middle_down, primary_down, middle_pointer_position, pointer_delta) =
                 ui.input(|input| {
                     (
                         input.pointer.button_pressed(PointerButton::Middle),
                         input.pointer.middle_down(),
+                        input.pointer.primary_down(),
                         input.pointer.interact_pos(),
                         input.pointer.delta(),
                     )
                 });
             if middle_pressed
-                && pointer_position
+                && middle_pointer_position
                     .is_some_and(|position| horizontal_output.inner_rect.contains(position))
             {
                 self.middle_pan_active = true;
@@ -1633,31 +1903,45 @@ impl ViewerApp {
             }
 
             let vertical_output = &mut horizontal_output.inner;
-            let manually_scrolled =
-                manual_wheel_scroll || (middle_panned && pointer_delta.y.abs() > f32::EPSILON);
+            let wheel_scrolled_away_from_latest = pointer_position
+                .is_some_and(|position| vertical_output.inner_rect.contains(position))
+                && scroll_delta_moves_away_from_latest(vertical_scroll_delta, latest_at);
+            // TableBuilder does not expose the vertical scrollbar response in this
+            // egui version. Treat a primary vertical drag over its viewport or
+            // scrollbar gutter as a manual move so it can cancel a pending jump.
+            let scrollbar_dragged = primary_down
+                && pointer_position.is_some_and(|position| {
+                    horizontal_output.inner_rect.expand(12.0).contains(position)
+                })
+                && pointer_delta.y.abs() > f32::EPSILON;
+            let manually_scrolled = wheel_scrolled_away_from_latest
+                || (middle_panned && pointer_delta.y.abs() > f32::EPSILON)
+                || scrollbar_dragged;
             if scroll_to_bottom_requested && !manually_scrolled && latest_at == LatestAt::Bottom {
-                vertical_output.state.offset.y =
-                    (vertical_output.content_size.y - vertical_output.inner_rect.height()).max(0.0);
+                // `scroll_to_row` is evaluated while the virtual table is being laid out.
+                // Use the completed output as the authority for the final position so
+                // a changed filter, wrap width, or deferred row measurement cannot
+                // leave records below the visible viewport.
+                vertical_output.state.offset.y = latest_scroll_offset(
+                    vertical_output.content_size.y,
+                    vertical_output.inner_rect.height(),
+                );
                 vertical_output.state.store(ui.ctx(), vertical_output.id);
             }
-            self.tail_was_at_bottom = scroll_is_at_latest(
-                vertical_output.state.offset.y,
-                vertical_output.content_size.y,
-                vertical_output.inner_rect.height(),
-                if manually_scrolled {
-                    1.0
-                } else {
-                    row_height.max(2.0)
-                },
-                latest_at,
-            );
+            self.tail_was_at_bottom = !manually_scrolled
+                && scroll_is_at_latest(
+                    vertical_output.state.offset.y,
+                    vertical_output.content_size.y,
+                    vertical_output.inner_rect.height(),
+                    row_height.max(2.0),
+                    latest_at,
+                );
             if !self.tail_was_at_bottom {
                 self.store.set_pruning_paused(true);
             }
-            // `scroll_to_row` updates the persisted offset after this frame. Keep the
-            // request alive until the following frame observes that the viewport
-            // really reached the end; otherwise a busy stream can disable tailing
-            // between issuing the command and egui applying it.
+            // This is the only automatic-scroll mechanism. Keep an explicit latest
+            // request alive until a subsequent frame reaches the actual edge; new
+            // records, Wrap, filter changes, and Jump all use this same path.
             (self.scroll_to_bottom_requested, self.scroll_settle_frames) = advance_scroll_request(
                 scroll_to_bottom_requested,
                 self.tail_was_at_bottom,
@@ -1725,7 +2009,118 @@ fn apply_primary_facet_click(selection: &mut FacetSelection, value: &str, additi
     }
 }
 
-fn show_event_cell(ui: &mut egui::Ui, column: TableColumn, event: &LogEvent, wrapped: bool) {
+fn highlighted_message(message: &str, default_color: Color32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let mut cursor = 0;
+    let mut plain_start = 0;
+
+    while cursor < message.len() {
+        let Some((end, tone)) = highlight_at(message, cursor) else {
+            cursor += message[cursor..]
+                .chars()
+                .next()
+                .expect("cursor is within the message")
+                .len_utf8();
+            continue;
+        };
+
+        append_message_text(
+            &mut job,
+            &message[plain_start..cursor],
+            default_color,
+            false,
+        );
+        append_message_text(&mut job, &message[cursor..end], tone.color(), true);
+        cursor = end;
+        plain_start = end;
+    }
+    append_message_text(&mut job, &message[plain_start..], default_color, false);
+    job
+}
+
+fn append_message_text(job: &mut LayoutJob, text: &str, color: Color32, strong: bool) {
+    if text.is_empty() {
+        return;
+    }
+    job.append(
+        text,
+        0.0,
+        TextFormat {
+            color,
+            font_id: FontId::proportional(14.0),
+            italics: false,
+            underline: if strong {
+                Stroke::new(0.75, color)
+            } else {
+                Stroke::NONE
+            },
+            ..Default::default()
+        },
+    );
+}
+
+fn highlight_at(message: &str, start: usize) -> Option<(usize, MessageTone)> {
+    if start > 0
+        && message[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_message_word_character)
+    {
+        return None;
+    }
+
+    MESSAGE_HIGHLIGHTS.iter().find_map(|(tone, phrase)| {
+        let end = phrase_end_at(message, start, phrase)?;
+        (!message[end..]
+            .chars()
+            .next()
+            .is_some_and(is_message_word_character))
+        .then_some((end, *tone))
+    })
+}
+
+fn phrase_end_at(message: &str, start: usize, phrase: &str) -> Option<usize> {
+    let mut position = start;
+    let mut words = phrase.split(' ').peekable();
+    while let Some(word) = words.next() {
+        let candidate = message.get(position..position + word.len())?;
+        if !candidate.eq_ignore_ascii_case(word) {
+            return None;
+        }
+        position += word.len();
+
+        if words.peek().is_some() {
+            let separator_start = position;
+            while message[position..]
+                .chars()
+                .next()
+                .is_some_and(is_phrase_separator)
+            {
+                position += message[position..].chars().next()?.len_utf8();
+            }
+            if position == separator_start {
+                return None;
+            }
+        }
+    }
+    Some(position)
+}
+
+fn is_message_word_character(character: char) -> bool {
+    character.is_alphanumeric()
+}
+
+fn is_phrase_separator(character: char) -> bool {
+    matches!(character, ' ' | '_' | '-' | '/' | '.')
+}
+
+fn show_event_cell(
+    ui: &mut egui::Ui,
+    column: TableColumn,
+    event: &LogEvent,
+    wrapped: bool,
+    semantic_highlighting: bool,
+) {
     match column {
         TableColumn::Timestamp => {
             ui.label(
@@ -1772,7 +2167,14 @@ fn show_event_cell(ui: &mut egui::Ui, column: TableColumn, event: &LogEvent, wra
             optional_cell(ui, (status != "-").then_some(status.as_str()));
         }
         TableColumn::Message => {
-            let label = Label::new(&event.message);
+            let label = if semantic_highlighting {
+                Label::new(highlighted_message(
+                    &event.message,
+                    ui.visuals().text_color(),
+                ))
+            } else {
+                Label::new(&event.message)
+            };
             ui.add(if wrapped {
                 label.wrap()
             } else {
@@ -1831,6 +2233,10 @@ fn scroll_is_at_end(
     maximum_offset - current_offset <= tolerance.max(0.0)
 }
 
+fn latest_scroll_offset(content_size: f32, viewport_size: f32) -> f32 {
+    (content_size - viewport_size).max(0.0)
+}
+
 fn scroll_is_at_latest(
     current_offset: f32,
     content_size: f32,
@@ -1846,10 +2252,38 @@ fn scroll_is_at_latest(
     }
 }
 
+fn scroll_delta_moves_away_from_latest(scroll_delta: f32, latest_at: LatestAt) -> bool {
+    match latest_at {
+        // In egui, a positive wheel delta moves the viewport toward earlier rows.
+        LatestAt::Bottom => scroll_delta > f32::EPSILON,
+        LatestAt::Top => scroll_delta < -f32::EPSILON,
+    }
+}
+
 fn order_visible_rows(rows: &mut [usize], latest_at: LatestAt) {
     if latest_at == LatestAt::Top {
         rows.reverse();
     }
+}
+
+fn latest_visible_row(rows: &[usize], latest_at: LatestAt) -> Option<usize> {
+    match latest_at {
+        LatestAt::Bottom => rows.last().copied(),
+        LatestAt::Top => rows.first().copied(),
+    }
+}
+
+fn latest_visible_id(store: &EventStore, rows: &[usize], latest_at: LatestAt) -> Option<u64> {
+    latest_visible_row(rows, latest_at).and_then(|row| store.event_id(row))
+}
+
+fn visible_tail_changed(
+    previous_latest: Option<u64>,
+    store: &EventStore,
+    current_rows: &[usize],
+    latest_at: LatestAt,
+) -> bool {
+    previous_latest != latest_visible_id(store, current_rows, latest_at)
 }
 
 fn advance_scroll_request(
@@ -1862,10 +2296,26 @@ fn advance_scroll_request(
         return (false, 0);
     }
     if !reached_bottom {
-        return (true, TAIL_SETTLE_FRAMES);
+        return (true, LATEST_SETTLE_FRAMES);
     }
     let remaining = settle_frames.saturating_sub(1);
     (remaining > 0, remaining)
+}
+
+fn should_reanchor_after_wrap(
+    wrap_changed: bool,
+    follow_latest: bool,
+    was_at_latest: bool,
+    latest_request_pending: bool,
+) -> bool {
+    wrap_changed && follow_latest && (was_at_latest || latest_request_pending)
+}
+
+fn can_refresh_filtered_rows_immediately(
+    has_text_filter: bool,
+    text_cache_is_current: bool,
+) -> bool {
+    !has_text_filter || text_cache_is_current
 }
 
 impl eframe::App for ViewerApp {
@@ -1921,6 +2371,7 @@ impl eframe::App for ViewerApp {
             version: 1,
             column_order: self.column_order.clone(),
             wrapped_messages: self.wrapped_messages,
+            semantic_highlighting: self.semantic_highlighting,
             stick_to_bottom: self.stick_to_bottom,
             color_by: self.color_by,
             bookmarks: self.bookmarks.clone(),
@@ -2023,6 +2474,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn semantic_highlighting_prefers_negative_compound_phrases() {
+        let message = "Not Found after a successful scan";
+        let job = highlighted_message(message, TEXT_PRIMARY);
+        let sections: Vec<(&str, Color32)> = job
+            .sections
+            .iter()
+            .map(|section| {
+                let range = section.byte_range.start.0..section.byte_range.end.0;
+                (&message[range], section.format.color)
+            })
+            .collect();
+
+        assert_eq!(
+            sections,
+            vec![
+                ("Not Found", DANGER),
+                (" after a ", TEXT_PRIMARY),
+                ("successful", SUCCESS),
+                (" scan", TEXT_PRIMARY),
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_highlighting_supports_common_log_phrase_separators() {
+        assert_eq!(
+            highlight_at("not_found", 0),
+            Some(("not_found".len(), MessageTone::Negative))
+        );
+        assert_eq!(
+            highlight_at("connection-refused", 0),
+            Some(("connection-refused".len(), MessageTone::Negative))
+        );
+        assert_eq!(highlight_at("not foundish", 0), None);
+        assert_eq!(
+            highlight_at("Complete", 0),
+            Some(("Complete".len(), MessageTone::Positive))
+        );
+        assert_eq!(
+            highlight_at("not configured", 0),
+            Some(("not configured".len(), MessageTone::Negative))
+        );
+    }
+
+    #[test]
     fn moving_columns_supports_before_and_after_drop_positions() {
         let mut columns = vec![
             TableColumn::Timestamp,
@@ -2112,20 +2608,93 @@ mod tests {
     }
 
     #[test]
+    fn visible_tail_detection_uses_stable_ingestion_identity() {
+        let mut store = EventStore::new(8);
+        let event =
+            |message| LogEvent::new(Level::Info, "test", "viewer", "event", message, "session");
+        store.extend([
+            event("hidden"),
+            event("visible older"),
+            event("visible latest"),
+        ]);
+        let visible_rows = [1, 2];
+        let previous_latest = latest_visible_id(&store, &visible_rows, LatestAt::Bottom).unwrap();
+
+        // A hidden record does not change the visible tail.
+        assert!(!visible_tail_changed(
+            Some(previous_latest),
+            &store,
+            &visible_rows,
+            LatestAt::Bottom,
+        ));
+
+        // A repeated message is still a new record and must advance Follow.
+        store.push(event("visible latest"));
+        assert!(visible_tail_changed(
+            Some(previous_latest),
+            &store,
+            &[1, 3],
+            LatestAt::Bottom
+        ));
+
+        // A prior event can move to a different index after pruning without
+        // becoming a new visible tail.
+        let mut pruned_store = EventStore::new(8);
+        pruned_store.extend([event("visible older"), event("visible latest")]);
+        let pruned_latest = latest_visible_id(&pruned_store, &[1], LatestAt::Bottom).unwrap();
+        assert!(!visible_tail_changed(
+            Some(pruned_latest),
+            &pruned_store,
+            &[1],
+            LatestAt::Bottom,
+        ));
+    }
+
+    #[test]
+    fn bottom_latest_offset_uses_the_entire_rendered_table_height() {
+        assert_eq!(latest_scroll_offset(900.0, 240.0), 660.0);
+        assert_eq!(latest_scroll_offset(180.0, 240.0), 0.0);
+    }
+
+    #[test]
+    fn only_scrolls_away_from_latest_cancel_a_pending_jump() {
+        assert!(scroll_delta_moves_away_from_latest(1.0, LatestAt::Bottom));
+        assert!(!scroll_delta_moves_away_from_latest(-1.0, LatestAt::Bottom));
+        assert!(scroll_delta_moves_away_from_latest(-1.0, LatestAt::Top));
+        assert!(!scroll_delta_moves_away_from_latest(1.0, LatestAt::Top));
+    }
+
+    #[test]
     fn tail_request_survives_until_the_new_offset_reaches_bottom() {
         assert_eq!(
-            advance_scroll_request(true, false, false, TAIL_SETTLE_FRAMES),
-            (true, TAIL_SETTLE_FRAMES)
+            advance_scroll_request(true, false, false, LATEST_SETTLE_FRAMES),
+            (true, LATEST_SETTLE_FRAMES)
         );
         assert_eq!(
-            advance_scroll_request(true, true, false, TAIL_SETTLE_FRAMES),
+            advance_scroll_request(true, true, false, LATEST_SETTLE_FRAMES),
             (true, 1)
         );
         assert_eq!(advance_scroll_request(true, true, false, 1), (false, 0));
         assert_eq!(
-            advance_scroll_request(true, false, true, TAIL_SETTLE_FRAMES),
+            advance_scroll_request(true, false, true, LATEST_SETTLE_FRAMES),
             (false, 0)
         );
+    }
+
+    #[test]
+    fn wrap_change_preserves_an_existing_latest_anchor() {
+        assert!(should_reanchor_after_wrap(true, true, true, false));
+        assert!(should_reanchor_after_wrap(true, true, false, true));
+        assert!(!should_reanchor_after_wrap(true, true, false, false));
+        assert!(!should_reanchor_after_wrap(true, false, true, false));
+        assert!(!should_reanchor_after_wrap(false, true, true, false));
+    }
+
+    #[test]
+    fn facet_changes_refresh_visible_rows_without_waiting_for_the_next_frame() {
+        assert!(can_refresh_filtered_rows_immediately(false, false));
+        assert!(can_refresh_filtered_rows_immediately(true, true));
+        assert!(!can_refresh_filtered_rows_immediately(true, false));
     }
 
     #[test]
