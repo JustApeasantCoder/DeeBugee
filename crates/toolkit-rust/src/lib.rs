@@ -13,7 +13,7 @@ use std::{
 
 use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
-use debug_logging_toolkit_schema::{Level, LogEvent};
+use dee_bugee_schema::{Level, LogEvent};
 use serde_json::{Map, Number, Value};
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context};
@@ -399,7 +399,7 @@ mod tests {
 
     fn test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "debug-logging-toolkit-{name}-{}-{}.jsonl",
+            "dee-bugee-{name}-{}-{}.jsonl",
             std::process::id(),
             NEXT_TEST.fetch_add(1, Ordering::Relaxed)
         ))

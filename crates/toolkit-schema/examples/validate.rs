@@ -4,13 +4,13 @@ use std::{
     path::PathBuf,
 };
 
-use debug_logging_toolkit_schema::LogEvent;
+use dee_bugee_schema::LogEvent;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .ok_or("usage: cargo run -p debug-logging-toolkit-schema --example validate -- <file>")?;
+        .ok_or("usage: cargo run -p dee-bugee-schema --example validate -- <file>")?;
     let reader = BufReader::new(File::open(&path)?);
     let mut valid = 0_u64;
     let mut invalid = 0_u64;

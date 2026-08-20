@@ -1,177 +1,271 @@
-# Debug Logging Toolkit
+# DeeBugee
 
-A native, reusable structured-log viewer and producer toolkit for desktop applications. The viewer is written in Rust with `eframe`/`egui` and `wgpu`; it does not run a browser, WebView, HTTP server, or local listening port.
+DeeBugee is a fast, native structured-log viewer for Windows. It follows JSONL log files in real time and turns large event streams into a searchable, filterable workspace that stays responsive during active development and production diagnostics.
 
-## MVP status
+The viewer is built with Rust, `egui`, and `wgpu`. Logs remain on the local machine: DeeBugee does not require a browser, WebView, HTTP server, or listening port.
 
-Implemented:
+## Highlights
 
-- Schema-versioned JSONL contract compatible with Streamee's current structured logs.
-- Native Windows viewer with GPU rendering.
-- Live polling of append-only files with partial-record buffering and truncation recovery.
-- Multiple simultaneous files and drag-and-drop.
-- Bounded 250,000-record in-memory window.
-- Virtualized fixed and variable-height tables.
-- Drag-and-drop table columns with persistent order and resizable widths.
-- Compact or wrapped messages plus a full event-details pane.
-- Facets for level, source, subsystem, tracing target, event, provider, status and correlation.
-- Automatic facets for scalar values in `fields`.
-- Left-click include-only, Ctrl+left-click additive include, and right-click exclusion.
-- Persistent filter bookmarks with full search/facet/level/correlation state.
-- Minimum-level, fuzzy multi-term text and correlation filtering.
-- Deterministic color grouping by source, subsystem, target, event, provider or correlation.
-- Pause, configurable latest-at-top/bottom tailing, saved TOML workspaces, and filtered JSONL export.
-- Automatic native persistence for column layout, panel sizing, bookmarks, color grouping, message wrapping, and tail preferences.
-- Explicit invalid-record and discarded-history counters.
-- Rust `tracing`, Electron main/renderer and .NET `ILoggerProvider` adapters.
-- Non-blocking bounded producer queues and full-record rotation.
+- Follow one or more append-only JSONL files in real time.
+- Open files from the picker, command line, or drag and drop.
+- Search messages and structured fields with fuzzy, multi-term matching.
+- Filter by level, source, subsystem, target, event, provider, status, correlation, and custom scalar fields.
+- Keep up to 250,000 recent records in a bounded in-memory window.
+- Reorder and resize columns, wrap messages, and inspect complete event details.
+- Save filter bookmarks and reusable TOML workspaces.
+- Color related events by source, subsystem, target, event, provider, or correlation.
+- Pause live following, choose whether the newest event appears at the top or bottom, and export filtered results.
+- Preserve layout and viewing preferences automatically between launches.
+- Produce compatible logs with the included Rust, Electron, and .NET adapters.
 
-Planned after the MVP is exercised with real applications:
+## Quick start
 
-- Timestamp range controls and richer query expressions.
-- Persistent on-disk indexes for histories larger than the memory window.
-- Optional named-pipe transport while retaining JSONL as the durable record.
-- Signed installers and published Cargo/npm/NuGet packages.
+### Requirements
 
-## Run the viewer
+- Windows 10 or Windows 11
+- A current stable Rust toolchain with Cargo
+
+Node.js/npm and the .NET 8 SDK are only required when building their respective adapters or examples.
+
+### Clone and build
 
 ```powershell
-cargo run --release -p debug-logging-toolkit -- "C:\path\to\Application.jsonl"
+git clone https://github.com/JustApeasantCoder/DeeBugee.git
+cd DeeBugee
+.\BUILD.bat
 ```
 
-For Streamee:
+The release executable is created at:
+
+```text
+target\release\dee-bugee.exe
+```
+
+You can also build directly with Cargo:
 
 ```powershell
-cargo run --release -p debug-logging-toolkit -- "$env:TEMP\streamee_logs\Streamee.jsonl"
+cargo build --release -p dee-bugee
 ```
 
-You can also launch without arguments and use **Open JSONL**, drag files onto the window, or open a saved workspace.
+### Open a log file
 
-## Facet controls
+Pass a JSONL file when launching DeeBugee:
 
-- Left-click a value to show only that value within the facet.
-- Ctrl+left-click to include another value using OR semantics.
+```powershell
+.\RUN.bat "C:\Logs\Application.jsonl"
+```
+
+Or run it directly through Cargo:
+
+```powershell
+cargo run --release -p dee-bugee -- "C:\Logs\Application.jsonl"
+```
+
+Launch without a path to start with an empty workspace:
+
+```powershell
+.\RUN.bat
+```
+
+Use **Open JSONL** to select files, drag files onto the window, or open a previously saved workspace. Multiple files can be followed at the same time.
+
+## Using the viewer
+
+### Search and filtering
+
+Search terms use AND semantics across messages, event names, sources, subsystems, correlation values, optional schema properties, and structured `fields`. Terms do not need to be adjacent, and small typing mistakes are tolerated.
+
+Facet controls provide fast structured filtering:
+
+- Left-click a value to include only that value in its facet.
+- Ctrl+left-click additional values to combine them with OR semantics.
 - Right-click a value to exclude it.
-- Click an already exclusive value again to return it to neutral.
-- Different facets combine with AND semantics.
-- Save the active combination from the bookmark bar above the table; left-click a bookmark to restore it and right-click to remove it.
+- Click an exclusive value again to return it to neutral.
+- Filters from different facets combine with AND semantics.
+- Use the minimum-level selector to hide lower-severity events.
 
-For example, left-clicking `backend` under Source and right-clicking `normalizer` under Subsystem produces:
+Save frequently used searches and facet combinations as bookmarks from the bar above the table. Left-click a bookmark to restore it and right-click it to remove it.
 
-```text
-source == backend AND subsystem != normalizer
+### Table and live-follow controls
+
+- Drag column headers to reorder them.
+- Drag column edges to resize them.
+- Use the horizontal scrollbar when the table is wider than the window.
+- Hold the middle mouse button over the table and drag to pan vertically or horizontally.
+- Switch between compact and wrapped messages.
+- Select a row to inspect the complete structured event.
+- Pause and resume live following at any time.
+- Place the latest record at the top or bottom of the table.
+
+Manual scrolling pauses automatic following until the latest edge is reached again. Column order, widths, panel sizes, bookmarks, message wrapping, colors, and tail preferences are restored automatically on the next launch.
+
+### Workspaces and export
+
+A saved TOML workspace records the open sources, filters, bookmarks, column order, color grouping, and latest-record position. Use workspaces to return to the same diagnostic setup later or share a repeatable view with another developer.
+
+Filtered records can be exported to a new JSONL file without modifying the source logs.
+
+## JSONL event format
+
+DeeBugee reads one JSON object per line. Each event must contain the following fields:
+
+- `schema_version`
+- `timestamp`
+- `level`
+- `source`
+- `subsystem`
+- `event`
+- `message`
+- `app_session_id`
+
+Example:
+
+```json
+{"schema_version":1,"timestamp":1787202000000,"level":"info","source":"desktop_app","subsystem":"worker","event":"job.completed","message":"Background job completed","app_session_id":"session-42","request_id":"request-108","duration_ms":36.4,"status":"ok","fields":{"items_processed":24}}
 ```
 
-## Table layout
+Supported levels are `trace`, `debug`, `info`, `warn`, `error`, and `fatal`. Timestamps may be Unix epoch milliseconds or RFC 3339 text. Additional properties are accepted, and scalar values inside `fields` automatically become filterable facets.
 
-- Drag any column header and drop it before or after another header to rearrange the table.
-- The blue insertion marker shows where the column will land.
-- Use the horizontal scrollbar below the table when the columns exceed the viewport.
-- Hold the middle mouse button over the table and drag to pan vertically and horizontally.
-- Column order, resized widths, panel sizes, message wrapping, color grouping, bookmarks, and latest position are saved automatically and restored on the next launch.
-- Saved workspaces include their sources, filters, bookmarks, color grouping, latest position, and column order.
-- Tail following can place the latest record at the top or bottom. Manual scrolling pauses following until the latest edge is reached again.
+The complete contract is defined in [`schemas/event-v1.schema.json`](schemas/event-v1.schema.json).
 
-## Search
+## Application integrations
 
-Search terms use AND semantics across the message, event, source, subsystem, correlation, optional schema fields, and structured `fields` values. Terms do not need to be adjacent, and small typos are tolerated. For example, both `Segment Local` and `segmant locl` match `[Segment Detection][Local]`.
+The adapters are included in this repository and currently support local path-based integration.
 
-## Workspace layout
+### Rust and Tauri
 
-```text
-crates/toolkit-schema   Shared Rust event types
-crates/toolkit-core     Bounded event store and bitmap facet indexes
-crates/toolkit-viewer   Native egui viewer and JSONL follower
-crates/toolkit-rust     Non-blocking tracing adapter and rotating writer
-adapters/electron       TypeScript Electron main/renderer adapter
-adapters/dotnet         Microsoft.Extensions.Logging provider
-schemas                 Language-neutral JSON Schema
-examples                Integration examples
-tests/fixtures          Viewer and adapter fixtures
+Add the Rust adapter as a path dependency:
+
+```toml
+[dependencies]
+dee-bugee-rust = { path = "path/to/DeeBugee/crates/toolkit-rust" }
 ```
 
-## Rust/Tauri integration
+Install the non-blocking `tracing` layer:
 
 ```rust
-use debug_logging_toolkit_rust::{LoggerConfig, non_blocking_layer};
+use dee_bugee_rust::{LoggerConfig, non_blocking_layer};
 use tracing_subscriber::prelude::*;
 
 let config = LoggerConfig::new(log_path, "backend");
-let (toolkit_layer, logging_guard) = non_blocking_layer(config)?;
+let (deebugee_layer, logging_guard) = non_blocking_layer(config)?;
+
 tracing_subscriber::registry()
-    .with(toolkit_layer)
+    .with(deebugee_layer)
     .init();
 
 tracing::info!(
-    subsystem = "torrent",
-    event = "torrent.ready",
+    subsystem = "worker",
+    event = "job.completed",
     request_id = request_id,
     duration_ms = elapsed.as_secs_f64() * 1000.0,
-    "Torrent ready"
+    "Background job completed"
 );
 
 // Keep logging_guard alive until application shutdown.
 ```
 
-The same layer works in a Tauri backend. A WebView renderer should batch events through a Tauri command, following the same pattern as the Electron renderer bridge.
+The same layer can be installed in a Tauri backend. Renderer events can be batched through a Tauri command and written through the shared adapter.
 
-The viewer accepts Streamee's schema-v1 Unix-millisecond timestamps and numeric process/session IDs. It also reads early adapter records that used RFC 3339 timestamp text, so existing JSONL files remain usable.
+### Electron
 
-## Electron integration
+Build the adapter before referencing it from an Electron application:
 
-Install the handler in the main process:
+```powershell
+cd adapters\electron
+npm install
+npm run build
+```
+
+Install the writer in the main process:
 
 ```ts
-import { installElectronLogging } from "@debug-logging-toolkit/electron";
+import { installElectronLogging } from "@deebugee/electron";
 
 const writer = installElectronLogging(ipcMain, logPath);
 ```
 
-Create the renderer logger in preload or the renderer bridge:
+Create a batched renderer logger in preload or another renderer bridge:
 
 ```ts
-import { createRendererLogger } from "@debug-logging-toolkit/electron/renderer";
+import { createRendererLogger } from "@deebugee/electron/renderer";
 
-const logger = createRendererLogger(ipcRenderer, { appSessionId });
+const logger = createRendererLogger(ipcRenderer, {
+  appSessionId,
+  source: "desktop_app",
+});
+
 logger.captureConsole();
-logger.log("info", "player.ready", "Player ready", { duration_ms: 42.5 }, "player");
+logger.log(
+  "info",
+  "window.ready",
+  "Main window is ready",
+  { duration_ms: 42.5 },
+  "interface",
+);
 ```
 
-## .NET integration
+### .NET
+
+Reference `adapters/dotnet/DeeBugee.Extensions.Logging/DeeBugee.Extensions.Logging.csproj` from the consuming project, then register the provider:
 
 ```csharp
-using DebugLoggingToolkit.Extensions.Logging;
+using DeeBugee.Extensions.Logging;
 using Microsoft.Extensions.Logging;
 
 using var factory = LoggerFactory.Create(builder =>
-    builder.AddDebugLoggingToolkit(new ToolkitLoggerOptions
+    builder.AddDeeBugee(new ToolkitLoggerOptions
     {
         Path = logPath,
-        Source = "app"
+        Source = "desktop_app"
     }));
 
-var logger = factory.CreateLogger("playback");
+var logger = factory.CreateLogger("worker");
 logger.LogInformation(
-    "Playback started with request {request_id} in {duration_ms} ms",
+    "Completed request {request_id} in {duration_ms} ms",
     requestId,
     elapsed.TotalMilliseconds);
 ```
 
-## Validation
+## Development and validation
+
+Run the complete Rust validation suite from the repository root:
 
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+```
 
+Validate the Electron adapter:
+
+```powershell
 cd adapters\electron
 npm install
 npm test
+```
 
-cd ..\dotnet\DebugLoggingToolkit.Extensions.Logging
-dotnet build -c Release
+Build the .NET adapter and example:
+
+```powershell
+dotnet build adapters\dotnet\DeeBugee.Extensions.Logging\DeeBugee.Extensions.Logging.csproj -c Release
+dotnet build examples\csharp\CSharpExample.csproj -c Release
+```
+
+## Repository layout
+
+```text
+crates/toolkit-schema   Shared Rust event types
+crates/toolkit-core     Bounded event store and bitmap facet indexes
+crates/toolkit-viewer   Native viewer and JSONL follower
+crates/toolkit-rust     Non-blocking tracing adapter and rotating writer
+adapters/electron       Electron main-process and renderer adapter
+adapters/dotnet         Microsoft.Extensions.Logging provider
+schemas                 Language-neutral JSON Schema
+examples                Integration examples
+tests/fixtures          Test data
 ```
 
 ## License
 
-MIT
+DeeBugee is available under the [MIT License](LICENSE).

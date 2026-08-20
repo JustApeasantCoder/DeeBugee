@@ -8,7 +8,7 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
-use debug_logging_toolkit_schema::LogEvent;
+use dee_bugee_schema::LogEvent;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_READ_PER_POLL: u64 = 4 * 1024 * 1024;
@@ -238,16 +238,14 @@ impl Drop for ReaderHandle {
 mod tests {
     use std::io::Write;
 
-    use debug_logging_toolkit_schema::{Level, LogEvent};
+    use dee_bugee_schema::{Level, LogEvent};
 
     use super::*;
 
     #[test]
     fn cursor_waits_for_complete_jsonl_records_and_then_emits_them() {
-        let path = std::env::temp_dir().join(format!(
-            "debug-logging-toolkit-follower-{}.jsonl",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("dee-bugee-follower-{}.jsonl", std::process::id()));
         let event = LogEvent::new(Level::Info, "backend", "test", "test", "hello", "app-1");
         let encoded = serde_json::to_string(&event).unwrap();
         let split = encoded.len() / 2;

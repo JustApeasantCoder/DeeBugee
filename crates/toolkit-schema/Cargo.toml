@@ -1,5 +1,5 @@
 [package]
-name = "debug-logging-toolkit-schema"
+name = "dee-bugee-schema"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

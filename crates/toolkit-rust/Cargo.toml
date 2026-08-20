@@ -1,5 +1,5 @@
 [package]
-name = "debug-logging-toolkit-rust"
+name = "dee-bugee-rust"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 [dependencies]
 chrono.workspace = true
 crossbeam-channel.workspace = true
-debug-logging-toolkit-schema = { path = "../toolkit-schema" }
+dee-bugee-schema = { path = "../toolkit-schema" }
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

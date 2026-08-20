@@ -1,12 +1,12 @@
 [package]
-name = "debug-logging-toolkit-core"
+name = "dee-bugee-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-debug-logging-toolkit-schema = { path = "../toolkit-schema" }
+dee-bugee-schema = { path = "../toolkit-schema" }
 roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true

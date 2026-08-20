@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\adapters\dotnet\DebugLoggingToolkit.Extensions.Logging\DebugLoggingToolkit.Extensions.Logging.csproj" />
+    <ProjectReference Include="..\..\adapters\dotnet\DeeBugee.Extensions.Logging\DeeBugee.Extensions.Logging.csproj" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
   </ItemGroup>
 </Project>

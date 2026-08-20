@@ -11,14 +11,14 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
-            .with_title("Debug Logging Toolkit")
+            .with_title("DeeBugee")
             .with_inner_size([1500.0, 900.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Debug Logging Toolkit",
+        "DeeBugee",
         options,
         Box::new(move |creation_context| {
             Ok(Box::new(ViewerApp::new(creation_context, initial_paths)))

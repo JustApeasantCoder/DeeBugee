@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use debug_logging_toolkit_rust::{LoggerConfig, non_blocking_layer};
+use dee_bugee_rust::{LoggerConfig, non_blocking_layer};
 use tracing_subscriber::prelude::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

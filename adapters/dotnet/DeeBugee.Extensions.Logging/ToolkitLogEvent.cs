@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace DebugLoggingToolkit.Extensions.Logging;
+namespace DeeBugee.Extensions.Logging;
 
 public sealed record ToolkitLogEvent
 {

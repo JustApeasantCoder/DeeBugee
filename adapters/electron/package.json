@@ -1,7 +1,16 @@
 {
-  "name": "@debug-logging-toolkit/electron",
+  "name": "@deebugee/electron",
   "version": "0.1.0",
-  "description": "Electron main and renderer adapters for Debug Logging Toolkit JSONL logs",
+  "description": "Electron main and renderer adapters for DeeBugee JSONL logs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JustApeasantCoder/DeeBugee.git",
+    "directory": "adapters/electron"
+  },
+  "bugs": {
+    "url": "https://github.com/JustApeasantCoder/DeeBugee/issues"
+  },
+  "homepage": "https://github.com/JustApeasantCoder/DeeBugee#readme",
   "type": "module",
   "main": "dist/main.js",
   "types": "dist/main.d.ts",

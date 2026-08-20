@@ -1,4 +1,4 @@
-namespace DebugLoggingToolkit.Extensions.Logging;
+namespace DeeBugee.Extensions.Logging;
 
 public sealed class ToolkitLoggerOptions
 {

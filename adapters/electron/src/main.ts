@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 
 import { type LogEventV1, isLogEvent } from "./schema.js";
 
-export const ELECTRON_LOG_CHANNEL = "debug-logging-toolkit:batch";
+export const ELECTRON_LOG_CHANNEL = "dee-bugee:batch";
 
 export interface IpcMainLike {
   on(channel: string, listener: (event: unknown, entries: unknown) => void): void;

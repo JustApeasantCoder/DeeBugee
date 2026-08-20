@@ -11,7 +11,7 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/JustApeasantCoder/Debug-Logging-Toolkit"
+repository = "https://github.com/JustApeasantCoder/DeeBugee"
 
 [workspace.dependencies]
 anyhow = "1.0"

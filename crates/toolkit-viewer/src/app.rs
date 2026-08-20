@@ -7,8 +7,8 @@ use std::{
 };
 
 use crossbeam_channel::TryRecvError;
-use debug_logging_toolkit_core::{EventStore, FilterState, PRIMARY_FACETS, status_text};
-use debug_logging_toolkit_schema::{Level, LogEvent};
+use dee_bugee_core::{EventStore, FilterState, PRIMARY_FACETS, status_text};
+use dee_bugee_schema::{Level, LogEvent};
 use eframe::egui::{self, Color32, Label, PointerButton, RichText, Sense, TextStyle};
 use egui_extras::{Column, TableBuilder};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ const DISPLAYED_FACETS: [&str; 8] = [
     "status",
     "correlation",
 ];
-const PREFERENCES_KEY: &str = "debug_logging_toolkit.viewer_preferences.v1";
+const PREFERENCES_KEY: &str = "dee_bugee.viewer_preferences.v1";
 const TAIL_HEADROOM_ROWS: f32 = 6.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

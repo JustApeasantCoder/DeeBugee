@@ -723,13 +723,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
-name = "debug-logging-toolkit"
+name = "dee-bugee"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
- "debug-logging-toolkit-core",
- "debug-logging-toolkit-schema",
+ "dee-bugee-core",
+ "dee-bugee-schema",
  "eframe",
  "egui",
  "egui_extras",
@@ -740,29 +740,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "debug-logging-toolkit-core"
+name = "dee-bugee-core"
 version = "0.1.0"
 dependencies = [
- "debug-logging-toolkit-schema",
+ "dee-bugee-schema",
  "roaring",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "debug-logging-toolkit-rust"
+name = "dee-bugee-rust"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "crossbeam-channel",
- "debug-logging-toolkit-schema",
+ "dee-bugee-schema",
  "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "debug-logging-toolkit-schema"
+name = "dee-bugee-schema"
 version = "0.1.0"
 dependencies = [
  "chrono",

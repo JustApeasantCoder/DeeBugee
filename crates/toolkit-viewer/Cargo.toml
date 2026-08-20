@@ -1,5 +1,5 @@
 [package]
-name = "debug-logging-toolkit"
+name = "dee-bugee"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,8 +8,8 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 crossbeam-channel.workspace = true
-debug-logging-toolkit-core = { path = "../toolkit-core" }
-debug-logging-toolkit-schema = { path = "../toolkit-schema" }
+dee-bugee-core = { path = "../toolkit-core" }
+dee-bugee-schema = { path = "../toolkit-schema" }
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true

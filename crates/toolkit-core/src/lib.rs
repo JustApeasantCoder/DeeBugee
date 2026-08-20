@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use debug_logging_toolkit_schema::{Level, LogEvent, scalar_text};
+use dee_bugee_schema::{Level, LogEvent, scalar_text};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -384,7 +384,7 @@ pub fn status_text(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use debug_logging_toolkit_schema::{Level, LogEvent};
+    use dee_bugee_schema::{Level, LogEvent};
 
     use super::*;
 

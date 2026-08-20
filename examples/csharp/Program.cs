@@ -1,10 +1,10 @@
-using DebugLoggingToolkit.Extensions.Logging;
+using DeeBugee.Extensions.Logging;
 using Microsoft.Extensions.Logging;
 
 var path = args.FirstOrDefault()
     ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ToolkitCSharpExample.jsonl");
 using var factory = LoggerFactory.Create(builder =>
-    builder.AddDebugLoggingToolkit(new ToolkitLoggerOptions
+    builder.AddDeeBugee(new ToolkitLoggerOptions
     {
         Path = path,
         Source = "app"

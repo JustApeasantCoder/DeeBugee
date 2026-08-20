@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://debugloggingtoolkit.dev/schema/event-v1.schema.json",
-  "title": "Debug Logging Toolkit Event v1",
+  "$id": "https://deebugee.dev/schema/event-v1.schema.json",
+  "title": "DeeBugee Event v1",
   "type": "object",
   "required": [
     "schema_version",

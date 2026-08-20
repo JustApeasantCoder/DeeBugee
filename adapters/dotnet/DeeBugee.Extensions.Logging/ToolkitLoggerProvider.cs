@@ -4,7 +4,7 @@ using System.Text.Json;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 
-namespace DebugLoggingToolkit.Extensions.Logging;
+namespace DeeBugee.Extensions.Logging;
 
 public sealed class ToolkitLoggerProvider : ILoggerProvider
 {
