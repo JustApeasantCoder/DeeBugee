@@ -304,6 +304,10 @@ Use `RUN.bat` for local development:
 
 It runs the debug build through the included development watcher. Saving Rust source changes recompiles and restarts the native viewer; this is the native-app equivalent of Vite hot reload. `RUN.bat` never changes the application version. Stop the reload loop with `Ctrl+C`.
 
+### Publish a release
+
+After installing [GitHub CLI](https://cli.github.com/) and completing `gh auth login` once, run `RELEASE.bat` from a clean, up-to-date `main` branch. It increments the synchronized patch version, builds the portable executable, commits and pushes the release source, then creates the GitHub release and uploads `dee-bugee.exe`.
+
 ### Validation
 
 Run the complete Rust validation suite from the repository root:
