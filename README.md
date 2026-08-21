@@ -65,21 +65,51 @@ To open your own JSONL file after building:
 
 You can also launch without a path to start with an empty workspace. DeeBugee does not silently reopen another project's logs. Use **Open JSONL** to select files, drag files onto the window, or open a previously saved workspace. Multiple files can be followed at the same time.
 
-### Project workspaces
+### Install once per developer
 
-For project scripts and concurrent work, pass an explicit workspace file. DeeBugee opens the workspace when it exists, or creates it when it does not. The workspace owns that project's sources, filters, bookmarks, layout, and live-tail settings.
-
-```powershell
-.\dee-bugee.exe --workspace "C:\@My APPs\Project A\.deebugee\workspace.toml" --logs "C:\Users\you\AppData\Local\Project A\logs"
-```
-
-Subsequent launches can omit `--logs` and reuse the project-owned source set:
+DeeBugee is already portable. Run the official PowerShell installer to download the latest release, verify its SHA-256 digest, and keep one shared copy outside your application repositories:
 
 ```powershell
-.\dee-bugee.exe --workspace "C:\@My APPs\Project A\.deebugee\workspace.toml"
+$installer = Join-Path $env:TEMP "Install-DeeBugee.ps1"
+Invoke-WebRequest https://raw.githubusercontent.com/JustApeasantCoder/DeeBugee/main/install.ps1 -OutFile $installer -UseBasicParsing
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -AddToPath
 ```
 
-`--logs` accepts one path per occurrence; unflagged paths remain supported for compatibility with the original command-line form. An explicit `--logs` source set replaces the workspace's saved sources for that launch and is then saved back to that workspace.
+The installer places `dee-bugee.exe` in `%LOCALAPPDATA%\Programs\DeeBugee` and, with `-AddToPath`, adds that directory to your user `PATH`. Open a new terminal after the first installation. Running the same commands later updates the shared executable without changing project manifests or saved workspace state.
+
+To install a specific release, pass its version without or with the leading `v`:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -Version 1.0.21 -AddToPath
+```
+
+Cloning this repository is only for contributing to DeeBugee; application developers do not need the Cargo workspace, adapters, tests, or source tree. You may still download the portable executable manually from the releases page if you prefer.
+
+### Configure a project
+
+An application repository can commit a small `.deebugee/project.toml` manifest:
+
+```toml
+version = 1
+id = "com.example.my-application"
+name = "My Application"
+sources = [
+  "%LOCALAPPDATA%/MyApplication/logs",
+  "logs/development",
+]
+```
+
+Environment variables use Windows `%NAME%` syntax. Relative sources resolve from the project root. Each source must be a JSONL file or a directory containing JSONL files.
+
+From a cloned application repository, run:
+
+```powershell
+dee-bugee.exe .
+```
+
+DeeBugee discovers `.deebugee/project.toml`, loads the configured sources, and stores that developer's filters, bookmarks, layout, and other workspace state privately under `%LOCALAPPDATA%\DeeBugee\projects`. The repository contains no DeeBugee executable, launcher scripts, or personal workspace file.
+
+Use `--project <path>` when launching from outside the project directory. `--logs <path>` can be repeated to temporarily override the manifest's sources. `--workspace <path>` remains available for opening or creating an explicit standalone workspace and cannot be combined with `--project`.
 
 ## Using DeeBugee
 
@@ -299,6 +329,7 @@ crates/toolkit-viewer   Native viewer and JSONL follower
 crates/toolkit-rust     Non-blocking tracing adapter and rotating writer
 adapters/electron       Electron main-process and renderer adapter
 adapters/dotnet         Microsoft.Extensions.Logging provider
+install.ps1             Verified user-level portable viewer installer
 schemas                 Language-neutral JSON Schema
 examples                Integration examples
 tests/fixtures          Test data

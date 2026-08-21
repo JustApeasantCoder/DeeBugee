@@ -60,30 +60,206 @@ const SUCCESS: Color32 = Color32::from_rgb(87, 205, 148);
 const WARNING: Color32 = Color32::from_rgb(240, 184, 82);
 const DANGER: Color32 = Color32::from_rgb(242, 108, 122);
 
-/// Launch inputs deliberately keep workspace identity separate from log paths.
-/// A workspace is project-owned state; log paths remain a portable, backwards-
-/// compatible command-line input.
+/// Launch inputs keep the shared project definition separate from private
+/// workspace state and backwards-compatible direct log paths.
 #[derive(Debug, Clone, Default)]
 pub struct LaunchRequest {
     pub workspace_path: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
     pub log_paths: Vec<PathBuf>,
 }
 
 impl LaunchRequest {
-    pub fn new(workspace_path: Option<PathBuf>, log_paths: Vec<PathBuf>) -> Self {
+    pub fn new(
+        workspace_path: Option<PathBuf>,
+        project_root: Option<PathBuf>,
+        log_paths: Vec<PathBuf>,
+    ) -> Self {
         Self {
             workspace_path,
+            project_root,
             log_paths,
         }
     }
 
     pub fn window_title(&self) -> String {
-        self.workspace_path
+        self.project_root
             .as_deref()
-            .and_then(workspace_display_name)
+            .and_then(project_display_name)
+            .or_else(|| {
+                self.workspace_path
+                    .as_deref()
+                    .and_then(workspace_display_name)
+            })
             .map(|name| format!("DeeBugee — {name}"))
             .unwrap_or_else(|| "DeeBugee".to_string())
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectConfig {
+    version: u16,
+    id: String,
+    name: String,
+    sources: Vec<String>,
+}
+
+struct ProjectLaunch {
+    workspace_path: PathBuf,
+    sources: Vec<PathBuf>,
+}
+
+fn project_display_name(path: &Path) -> Option<String> {
+    let manifest_path = project_manifest_path(path);
+    if let Ok(text) = std::fs::read_to_string(&manifest_path)
+        && let Ok(config) = toml::from_str::<ProjectConfig>(&text)
+        && !config.name.trim().is_empty()
+    {
+        return Some(config.name.trim().to_owned());
+    }
+    let root = if path.is_file() {
+        let parent = path.parent()?;
+        if parent.file_name().is_some_and(|name| name == ".deebugee") {
+            parent.parent()?
+        } else {
+            parent
+        }
+    } else {
+        path
+    };
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+}
+
+fn project_manifest_path(path: &Path) -> PathBuf {
+    if path.is_file() {
+        path.to_path_buf()
+    } else {
+        path.join(".deebugee").join("project.toml")
+    }
+}
+
+fn project_root_from_manifest(manifest_path: &Path) -> Result<PathBuf, String> {
+    let manifest_parent = manifest_path
+        .parent()
+        .ok_or_else(|| format!("Project manifest {} has no parent", manifest_path.display()))?;
+    if manifest_parent
+        .file_name()
+        .is_some_and(|name| name == ".deebugee")
+    {
+        manifest_parent
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| {
+                format!(
+                    "Project manifest {} has no project root",
+                    manifest_path.display()
+                )
+            })
+    } else {
+        Ok(manifest_parent.to_path_buf())
+    }
+}
+
+fn load_project(path: &Path) -> Result<ProjectLaunch, String> {
+    let manifest_path = project_manifest_path(path);
+    let project_root = project_root_from_manifest(&manifest_path)?;
+    let text = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        format!(
+            "Unable to read project manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let config = toml::from_str::<ProjectConfig>(&text).map_err(|error| {
+        format!(
+            "Unable to parse project manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    if config.version != 1 {
+        return Err(format!(
+            "Unsupported project manifest version {} in {}",
+            config.version,
+            manifest_path.display()
+        ));
+    }
+    if config.id.trim().is_empty() || config.name.trim().is_empty() {
+        return Err(format!(
+            "Project manifest {} requires non-empty id and name values",
+            manifest_path.display()
+        ));
+    }
+    if config.sources.is_empty() {
+        return Err(format!(
+            "Project manifest {} requires at least one source",
+            manifest_path.display()
+        ));
+    }
+    let sources = config
+        .sources
+        .iter()
+        .map(|source| {
+            let expanded = expand_environment_variables(source, |name| std::env::var_os(name))?;
+            let path = PathBuf::from(expanded);
+            Ok(if path.is_absolute() {
+                path
+            } else {
+                project_root.join(path)
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| "LOCALAPPDATA is unavailable; cannot store project workspace".to_string())?;
+    let workspace_path = PathBuf::from(local_app_data)
+        .join("DeeBugee")
+        .join("projects")
+        .join(stable_project_key(config.id.trim()))
+        .join("workspace.toml");
+    Ok(ProjectLaunch {
+        workspace_path,
+        sources,
+    })
+}
+
+fn expand_environment_variables<F>(value: &str, mut lookup: F) -> Result<String, String>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    let mut expanded = String::with_capacity(value.len());
+    let mut remainder = value;
+    while let Some(start) = remainder.find('%') {
+        expanded.push_str(&remainder[..start]);
+        let variable = &remainder[start + 1..];
+        let Some(end) = variable.find('%') else {
+            return Err(format!(
+                "Unclosed environment variable in project source: {value}"
+            ));
+        };
+        let name = &variable[..end];
+        if name.is_empty() {
+            return Err(format!(
+                "Empty environment variable in project source: {value}"
+            ));
+        }
+        let replacement =
+            lookup(name).ok_or_else(|| format!("Environment variable %{name}% is unavailable"))?;
+        expanded.push_str(&replacement.to_string_lossy());
+        remainder = &variable[end + 1..];
+    }
+    expanded.push_str(remainder);
+    Ok(expanded)
+}
+
+fn stable_project_key(id: &str) -> String {
+    let hash = id
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    format!("{hash:016x}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -833,7 +1009,17 @@ impl ViewerApp {
             .egui_ctx
             .set_zoom_factor(preferences.ui_scale);
 
-        let (workspace_path, workspace, startup_error) = match launch.workspace_path {
+        let (project_workspace_path, project_sources, project_error) =
+            match launch.project_root.as_deref() {
+                Some(path) => match load_project(path) {
+                    Ok(project) => (Some(project.workspace_path), Some(project.sources), None),
+                    Err(error) => (None, None, Some(error)),
+                },
+                None => (None, None, None),
+            };
+        let conflicting_targets = launch.project_root.is_some() && launch.workspace_path.is_some();
+        let requested_workspace_path = project_workspace_path.or(launch.workspace_path);
+        let (workspace_path, workspace, workspace_error) = match requested_workspace_path {
             Some(path) if path.exists() => match load_workspace(&path) {
                 Ok(workspace) => (Some(path), Some(workspace), None),
                 Err(error) => (None, None, Some(error)),
@@ -845,13 +1031,20 @@ impl ViewerApp {
             ),
             None => (None, None, None),
         };
-        let paths_to_open = if launch.log_paths.is_empty() {
+        let startup_error = if conflicting_targets {
+            Some("Use either --project or --workspace, not both".to_string())
+        } else {
+            project_error.or(workspace_error)
+        };
+        let paths_to_open = if !launch.log_paths.is_empty() {
+            launch.log_paths
+        } else if let Some(project_sources) = project_sources {
+            project_sources
+        } else {
             workspace
                 .as_ref()
                 .map(|workspace| workspace.sources.clone())
                 .unwrap_or_default()
-        } else {
-            launch.log_paths
         };
         let filter = workspace
             .as_ref()
@@ -3694,5 +3887,49 @@ mod tests {
             bookmark_scope_key(&[beta.clone(), alpha.clone()])
         );
         assert_ne!(bookmark_scope_key(&[alpha]), bookmark_scope_key(&[beta]));
+    }
+
+    #[test]
+    fn project_manifest_resolves_relative_sources_and_private_workspace() {
+        let root =
+            std::env::temp_dir().join(format!("dee-bugee-project-manifest-{}", std::process::id()));
+        let manifest_directory = root.join(".deebugee");
+        std::fs::create_dir_all(&manifest_directory).unwrap();
+        std::fs::write(
+            manifest_directory.join("project.toml"),
+            r#"version = 1
+id = "com.example.viewer-test"
+name = "Viewer Test"
+sources = ["logs"]
+"#,
+        )
+        .unwrap();
+
+        let project = load_project(&root).unwrap();
+        assert_eq!(project.sources, vec![root.join("logs")]);
+        assert_eq!(project_display_name(&root).as_deref(), Some("Viewer Test"));
+        assert!(project.workspace_path.ends_with("workspace.toml"));
+        assert!(
+            project
+                .workspace_path
+                .to_string_lossy()
+                .contains(&stable_project_key("com.example.viewer-test"))
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_sources_expand_environment_variables_without_guessing() {
+        let expanded = expand_environment_variables("%DATA_ROOT%/logs", |name| {
+            (name == "DATA_ROOT").then(|| std::ffi::OsString::from("C:/project-data"))
+        })
+        .unwrap();
+        assert_eq!(expanded, "C:/project-data/logs");
+        assert!(
+            expand_environment_variables("%MISSING%/logs", |_| None)
+                .unwrap_err()
+                .contains("%MISSING%")
+        );
     }
 }
