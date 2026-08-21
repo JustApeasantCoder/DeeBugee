@@ -1,0 +1,5 @@
+interface:
+  display_name: "DeeBugee"
+  short_description: "Diagnose, integrate, and develop DeeBugee logging"
+  default_prompt: "Use $deebugee to diagnose this application with structured local logs, improve its instrumentation, or develop DeeBugee itself."
+

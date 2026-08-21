@@ -1,0 +1,4 @@
+interface:
+  display_name: "DeeBugee Project Install"
+  short_description: "Install DeeBugee and configure project manifests"
+
