@@ -63,7 +63,23 @@ To open your own JSONL file after building:
 .\target\release\dee-bugee.exe "C:\Logs\Application.jsonl"
 ```
 
-You can also launch without a path to start with an empty workspace. Use **Open JSONL** to select files, drag files onto the window, or open a previously saved workspace. Multiple files can be followed at the same time.
+You can also launch without a path to start with an empty workspace. DeeBugee does not silently reopen another project's logs. Use **Open JSONL** to select files, drag files onto the window, or open a previously saved workspace. Multiple files can be followed at the same time.
+
+### Project workspaces
+
+For project scripts and concurrent work, pass an explicit workspace file. DeeBugee opens the workspace when it exists, or creates it when it does not. The workspace owns that project's sources, filters, bookmarks, layout, and live-tail settings.
+
+```powershell
+.\dee-bugee.exe --workspace "C:\@My APPs\Project A\.deebugee\workspace.toml" --logs "C:\Users\you\AppData\Local\Project A\logs"
+```
+
+Subsequent launches can omit `--logs` and reuse the project-owned source set:
+
+```powershell
+.\dee-bugee.exe --workspace "C:\@My APPs\Project A\.deebugee\workspace.toml"
+```
+
+`--logs` accepts one path per occurrence; unflagged paths remain supported for compatibility with the original command-line form. An explicit `--logs` source set replaces the workspace's saved sources for that launch and is then saved back to that workspace.
 
 ## Using DeeBugee
 
@@ -79,7 +95,7 @@ Facet controls provide fast structured filtering. Feature tags are derived consi
 - Filters from different facets combine with AND semantics.
 - Use the minimum-level selector to hide lower-severity events.
 
-Save frequently used searches and facet combinations as bookmarks from the bar above the table. Left-click a bookmark to restore it and right-click it to remove it.
+Save frequently used searches and facet combinations as bookmarks from the bar above the table. Saved views belong to the selected JSONL file or source set, so opening another log starts with its own views and reopening a log restores its views. Left-click a bookmark to restore it, Ctrl+Alt+left-click to replace it with the current filters, middle-click to rename it, and right-click to remove it.
 
 ### Table and live-follow controls
 
@@ -93,7 +109,7 @@ Manual vertical scrolling pauses automatic following until you return to the lat
 
 ### Workspaces and export
 
-A saved TOML workspace records the open sources, filters, bookmarks, column order, color grouping, latest-record position, and log limit. Use workspaces to return to the same diagnostic setup later or share a repeatable view with another developer.
+A saved TOML workspace records the open sources, filters, bookmarks, column order, color grouping, latest-record position, and log limit. Use workspaces to return to the same diagnostic setup later, keep projects isolated, or share a repeatable view with another developer.
 
 Filtered records can be exported to a new JSONL file without modifying source logs.
 

@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     io::{BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -18,7 +18,8 @@ use dee_bugee_core::{
 };
 use dee_bugee_schema::{Level, LogEvent};
 use eframe::egui::{
-    self, Color32, FontFamily, FontId, Label, PointerButton, RichText, Sense, Stroke, TextStyle,
+    self, Color32, FontFamily, FontId, Label, PointerButton, PopupCloseBehavior, RichText, Sense,
+    Stroke, TextStyle,
     text::{LayoutJob, TextFormat},
 };
 use egui_extras::{Column, TableBuilder};
@@ -43,6 +44,9 @@ const LATEST_SETTLE_FRAMES: u8 = 2;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 const MAX_CONFIGURABLE_EVENTS: usize = 5_000_000;
 const DEFAULT_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f %:z";
+const DEFAULT_UI_SCALE: f32 = 1.0;
+const MIN_UI_SCALE: f32 = 0.75;
+const MAX_UI_SCALE: f32 = 1.50;
 
 const SURFACE_0: Color32 = Color32::from_rgb(13, 16, 22);
 const SURFACE_1: Color32 = Color32::from_rgb(18, 22, 29);
@@ -55,6 +59,32 @@ const ACCENT_SOFT: Color32 = Color32::from_rgb(34, 53, 91);
 const SUCCESS: Color32 = Color32::from_rgb(87, 205, 148);
 const WARNING: Color32 = Color32::from_rgb(240, 184, 82);
 const DANGER: Color32 = Color32::from_rgb(242, 108, 122);
+
+/// Launch inputs deliberately keep workspace identity separate from log paths.
+/// A workspace is project-owned state; log paths remain a portable, backwards-
+/// compatible command-line input.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchRequest {
+    pub workspace_path: Option<PathBuf>,
+    pub log_paths: Vec<PathBuf>,
+}
+
+impl LaunchRequest {
+    pub fn new(workspace_path: Option<PathBuf>, log_paths: Vec<PathBuf>) -> Self {
+        Self {
+            workspace_path,
+            log_paths,
+        }
+    }
+
+    pub fn window_title(&self) -> String {
+        self.workspace_path
+            .as_deref()
+            .and_then(workspace_display_name)
+            .map(|name| format!("DeeBugee — {name}"))
+            .unwrap_or_else(|| "DeeBugee".to_string())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageTone {
@@ -467,6 +497,12 @@ struct FilterBookmark {
     filter: FilterState,
 }
 
+#[derive(Debug, Clone)]
+struct BookmarkRename {
+    index: usize,
+    name: String,
+}
+
 /// A collapsed run of equivalent events in the current filtered view.
 /// The newest occurrence remains the table representative, so a live event burst
 /// stays at the newest point in the log rather than being stranded at its first row.
@@ -553,11 +589,15 @@ struct ViewerPreferences {
     stick_to_bottom: bool,
     color_by: ColorBy,
     bookmarks: Vec<FilterBookmark>,
+    #[serde(default)]
+    bookmarks_by_source: BTreeMap<String, Vec<FilterBookmark>>,
     latest_at: LatestAt,
     max_events: usize,
     timestamp_display: TimestampDisplay,
     timestamp_format: String,
     group_errors: bool,
+    #[serde(default = "default_ui_scale")]
+    ui_scale: f32,
 }
 
 impl Default for ViewerPreferences {
@@ -572,13 +612,19 @@ impl Default for ViewerPreferences {
             stick_to_bottom: true,
             color_by: ColorBy::Off,
             bookmarks: Vec::new(),
+            bookmarks_by_source: BTreeMap::new(),
             latest_at: LatestAt::Bottom,
             max_events: DEFAULT_MAX_EVENTS,
             timestamp_display: TimestampDisplay::default(),
             timestamp_format: default_timestamp_format(),
             group_errors: false,
+            ui_scale: DEFAULT_UI_SCALE,
         }
     }
+}
+
+const fn default_ui_scale() -> f32 {
+    DEFAULT_UI_SCALE
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -606,6 +652,27 @@ struct WorkspaceConfig {
     timestamp_format: String,
     #[serde(default)]
     group_errors: bool,
+}
+
+impl WorkspaceConfig {
+    fn new(sources: Vec<PathBuf>) -> Self {
+        Self {
+            version: 1,
+            sources,
+            filter: FilterState::default(),
+            wrapped_messages: true,
+            semantic_highlighting: false,
+            stick_to_bottom: true,
+            color_by: ColorBy::Off,
+            bookmarks: Vec::new(),
+            latest_at: LatestAt::Bottom,
+            column_order: default_column_order(),
+            max_events: DEFAULT_MAX_EVENTS,
+            timestamp_display: TimestampDisplay::default(),
+            timestamp_format: default_timestamp_format(),
+            group_errors: false,
+        }
+    }
 }
 
 const fn default_max_events() -> usize {
@@ -710,6 +777,7 @@ pub struct ViewerApp {
     facet_counts: BTreeMap<String, Vec<(String, u64)>>,
     reader: ReaderHandle,
     sources: Vec<PathBuf>,
+    workspace_path: Option<PathBuf>,
     selected_row: Option<usize>,
     invalid_records: u64,
     last_error: Option<String>,
@@ -721,6 +789,9 @@ pub struct ViewerApp {
     stick_to_bottom: bool,
     color_by: ColorBy,
     bookmarks: Vec<FilterBookmark>,
+    bookmarks_by_source: BTreeMap<String, Vec<FilterBookmark>>,
+    bookmark_scope: Option<String>,
+    bookmark_rename: Option<BookmarkRename>,
     latest_at: LatestAt,
     column_order: Vec<TableColumn>,
     middle_pan_active: bool,
@@ -740,16 +811,14 @@ pub struct ViewerApp {
     timestamp_display: TimestampDisplay,
     timestamp_format: String,
     group_errors: bool,
+    ui_scale: f32,
     table_rows: Vec<usize>,
     error_groups: BTreeMap<usize, ErrorGroup>,
     event_limit_reload_pending: bool,
 }
 
 impl ViewerApp {
-    pub fn new(
-        creation_context: &eframe::CreationContext<'_>,
-        initial_paths: Vec<PathBuf>,
-    ) -> Self {
+    pub fn new(creation_context: &eframe::CreationContext<'_>, launch: LaunchRequest) -> Self {
         configure_ui(&creation_context.egui_ctx);
 
         let mut preferences = creation_context
@@ -759,38 +828,122 @@ impl ViewerApp {
             .unwrap_or_default();
         preferences.column_order = normalize_column_order(preferences.column_order);
         preferences.max_events = preferences.max_events.clamp(1, MAX_CONFIGURABLE_EVENTS);
+        preferences.ui_scale = preferences.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
+        creation_context
+            .egui_ctx
+            .set_zoom_factor(preferences.ui_scale);
 
-        // An explicit file or folder launch is intentional, so it takes precedence
-        // over the previous session. Normal launches reopen the exact log files the
-        // user had open last time.
-        let restored_sources = initial_paths
-            .is_empty()
-            .then(|| preferences.sources.clone());
-        let paths_to_open = restored_sources.clone().unwrap_or(initial_paths);
-        let reader = spawn_reader(paths_to_open);
+        let (workspace_path, workspace, startup_error) = match launch.workspace_path {
+            Some(path) if path.exists() => match load_workspace(&path) {
+                Ok(workspace) => (Some(path), Some(workspace), None),
+                Err(error) => (None, None, Some(error)),
+            },
+            Some(path) => (
+                Some(path),
+                Some(WorkspaceConfig::new(launch.log_paths.clone())),
+                None,
+            ),
+            None => (None, None, None),
+        };
+        let paths_to_open = if launch.log_paths.is_empty() {
+            workspace
+                .as_ref()
+                .map(|workspace| workspace.sources.clone())
+                .unwrap_or_default()
+        } else {
+            launch.log_paths
+        };
+        let filter = workspace
+            .as_ref()
+            .map(|workspace| workspace.filter.clone())
+            .unwrap_or_default();
+        let wrapped_messages = workspace
+            .as_ref()
+            .map(|workspace| workspace.wrapped_messages)
+            .unwrap_or(preferences.wrapped_messages);
+        let semantic_highlighting = workspace
+            .as_ref()
+            .map(|workspace| workspace.semantic_highlighting)
+            .unwrap_or(preferences.semantic_highlighting);
+        let stick_to_bottom = workspace
+            .as_ref()
+            .map(|workspace| workspace.stick_to_bottom)
+            .unwrap_or(preferences.stick_to_bottom);
+        let color_by = workspace
+            .as_ref()
+            .map(|workspace| workspace.color_by)
+            .unwrap_or(preferences.color_by);
+        let latest_at = workspace
+            .as_ref()
+            .map(|workspace| workspace.latest_at)
+            .unwrap_or(preferences.latest_at);
+        let column_order = normalize_column_order(
+            workspace
+                .as_ref()
+                .map(|workspace| workspace.column_order.clone())
+                .unwrap_or(preferences.column_order),
+        );
+        let max_events = workspace
+            .as_ref()
+            .map(|workspace| workspace.max_events)
+            .unwrap_or(preferences.max_events)
+            .clamp(1, MAX_CONFIGURABLE_EVENTS);
+        let timestamp_display = workspace
+            .as_ref()
+            .map(|workspace| workspace.timestamp_display)
+            .unwrap_or(preferences.timestamp_display);
+        let timestamp_format = workspace
+            .as_ref()
+            .map(|workspace| workspace.timestamp_format.clone())
+            .unwrap_or(preferences.timestamp_format);
+        let group_errors = workspace
+            .as_ref()
+            .map(|workspace| workspace.group_errors)
+            .unwrap_or(preferences.group_errors);
+        let bookmark_scope = bookmark_scope_key(&paths_to_open);
+        let mut bookmarks_by_source = preferences.bookmarks_by_source;
+        let bookmarks = workspace.as_ref().map_or_else(
+            || {
+                bookmark_scope
+                    .as_ref()
+                    .map(|scope| {
+                        bookmarks_by_source
+                            .entry(scope.clone())
+                            .or_insert_with(|| preferences.bookmarks.clone())
+                            .clone()
+                    })
+                    .unwrap_or_default()
+            },
+            |workspace| workspace.bookmarks.clone(),
+        );
+        let reader = spawn_reader(paths_to_open.clone());
         let search_worker = SearchWorker::spawn(creation_context.egui_ctx.clone());
         let mut app = Self {
-            store: EventStore::new(preferences.max_events),
-            filter: preferences.filter,
+            store: EventStore::new(max_events),
+            filter,
             visible_rows: Vec::new(),
             facet_counts: BTreeMap::new(),
             reader,
-            // Seed saved sources immediately so a quick close cannot replace the
-            // remembered session before the reader has announced every file.
-            sources: restored_sources.unwrap_or_default(),
+            // Keep explicit workspace sources even if the reader has not yet
+            // completed its first poll, so a newly created workspace is durable.
+            sources: paths_to_open,
+            workspace_path,
             selected_row: None,
             invalid_records: 0,
-            last_error: None,
+            last_error: startup_error,
             last_notice: None,
             paused: false,
             filters_dirty: true,
-            wrapped_messages: preferences.wrapped_messages,
-            semantic_highlighting: preferences.semantic_highlighting,
-            stick_to_bottom: preferences.stick_to_bottom,
-            color_by: preferences.color_by,
-            bookmarks: preferences.bookmarks,
-            latest_at: preferences.latest_at,
-            column_order: preferences.column_order,
+            wrapped_messages,
+            semantic_highlighting,
+            stick_to_bottom,
+            color_by,
+            bookmarks,
+            bookmarks_by_source,
+            bookmark_scope,
+            bookmark_rename: None,
+            latest_at,
+            column_order,
             middle_pan_active: false,
             tail_was_at_bottom: true,
             scroll_to_bottom_requested: true,
@@ -804,10 +957,11 @@ impl ViewerApp {
             text_matches_query: String::new(),
             text_matches_event_count: 0,
             text_matches_discarded_events: 0,
-            max_events: preferences.max_events,
-            timestamp_display: preferences.timestamp_display,
-            timestamp_format: preferences.timestamp_format,
-            group_errors: preferences.group_errors,
+            max_events,
+            timestamp_display,
+            timestamp_format,
+            group_errors,
+            ui_scale: preferences.ui_scale,
             table_rows: Vec::new(),
             error_groups: BTreeMap::new(),
             event_limit_reload_pending: false,
@@ -815,6 +969,9 @@ impl ViewerApp {
         app.refresh_filters();
         if !app.filter.text.trim().is_empty() {
             app.schedule_text_search(Duration::ZERO);
+        }
+        if let Err(error) = app.save_active_workspace() {
+            app.last_error = Some(format!("Unable to create active workspace: {error}"));
         }
         app
     }
@@ -1137,6 +1294,9 @@ impl ViewerApp {
         if paths.is_empty() {
             return;
         }
+        let mut requested_paths = self.sources.clone();
+        requested_paths.extend(paths.iter().cloned());
+        self.switch_bookmark_scope(&requested_paths);
         if self
             .reader
             .commands
@@ -1145,6 +1305,25 @@ impl ViewerApp {
         {
             self.last_error = Some("JSONL reader is unavailable".to_string());
         }
+    }
+
+    fn switch_bookmark_scope(&mut self, paths: &[PathBuf]) {
+        let next_scope = bookmark_scope_key(paths);
+        if self.bookmark_scope == next_scope {
+            return;
+        }
+
+        if let Some(scope) = self.bookmark_scope.take() {
+            self.bookmarks_by_source
+                .insert(scope, std::mem::take(&mut self.bookmarks));
+        }
+        self.bookmarks = next_scope
+            .as_ref()
+            .and_then(|scope| self.bookmarks_by_source.get(scope))
+            .cloned()
+            .unwrap_or_default();
+        self.bookmark_scope = next_scope;
+        self.bookmark_rename = None;
     }
 
     fn apply_event_limit(&mut self, max_events: usize) {
@@ -1173,9 +1352,10 @@ impl ViewerApp {
     }
 
     fn replace_paths(&mut self, paths: Vec<PathBuf>) {
-        self.reader = spawn_reader(paths);
+        self.switch_bookmark_scope(&paths);
+        self.reader = spawn_reader(paths.clone());
         self.store = EventStore::new(self.max_events);
-        self.sources.clear();
+        self.sources = paths;
         self.selected_row = None;
         self.invalid_records = 0;
         self.last_error = None;
@@ -1207,6 +1387,38 @@ impl ViewerApp {
         self.last_notice = Some("Cleared loaded logs. Open a JSONL file to begin.".to_string());
     }
 
+    fn active_workspace_config(&self) -> WorkspaceConfig {
+        WorkspaceConfig {
+            version: 1,
+            sources: self.sources.clone(),
+            filter: self.filter.clone(),
+            wrapped_messages: self.wrapped_messages,
+            semantic_highlighting: self.semantic_highlighting,
+            stick_to_bottom: self.stick_to_bottom,
+            color_by: self.color_by,
+            bookmarks: self.bookmarks.clone(),
+            latest_at: self.latest_at,
+            column_order: self.column_order.clone(),
+            max_events: self.max_events,
+            timestamp_display: self.timestamp_display,
+            timestamp_format: self.timestamp_format.clone(),
+            group_errors: self.group_errors,
+        }
+    }
+
+    fn save_active_workspace(&self) -> Result<(), String> {
+        let Some(path) = &self.workspace_path else {
+            return Ok(());
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("Workspace path {} has no parent folder", path.display()))?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let text = toml::to_string_pretty(&self.active_workspace_config())
+            .map_err(|error| error.to_string())?;
+        std::fs::write(path, text).map_err(|error| error.to_string())
+    }
+
     fn open_workspace(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Toolkit workspace", &["toml"])
@@ -1226,7 +1438,6 @@ impl ViewerApp {
                 self.semantic_highlighting = workspace.semantic_highlighting;
                 self.stick_to_bottom = workspace.stick_to_bottom;
                 self.color_by = workspace.color_by;
-                self.bookmarks = workspace.bookmarks;
                 self.latest_at = workspace.latest_at;
                 self.column_order = normalize_column_order(workspace.column_order);
                 self.apply_event_limit(workspace.max_events);
@@ -1234,6 +1445,12 @@ impl ViewerApp {
                 self.timestamp_format = workspace.timestamp_format;
                 self.group_errors = workspace.group_errors;
                 self.replace_paths(workspace.sources);
+                self.workspace_path = Some(path.clone());
+                if let Some(scope) = &self.bookmark_scope {
+                    self.bookmarks_by_source
+                        .insert(scope.clone(), workspace.bookmarks.clone());
+                }
+                self.bookmarks = workspace.bookmarks;
                 self.last_notice = Some(format!("Opened workspace {}", path.display()));
             }
             Ok(workspace) => {
@@ -1254,26 +1471,8 @@ impl ViewerApp {
         else {
             return;
         };
-        let workspace = WorkspaceConfig {
-            version: 1,
-            sources: self.sources.clone(),
-            filter: self.filter.clone(),
-            wrapped_messages: self.wrapped_messages,
-            semantic_highlighting: self.semantic_highlighting,
-            stick_to_bottom: self.stick_to_bottom,
-            color_by: self.color_by,
-            bookmarks: self.bookmarks.clone(),
-            latest_at: self.latest_at,
-            column_order: self.column_order.clone(),
-            max_events: self.max_events,
-            timestamp_display: self.timestamp_display,
-            timestamp_format: self.timestamp_format.clone(),
-            group_errors: self.group_errors,
-        };
-        match toml::to_string_pretty(&workspace)
-            .map_err(|error| error.to_string())
-            .and_then(|text| std::fs::write(&path, text).map_err(|error| error.to_string()))
-        {
+        self.workspace_path = Some(path.clone());
+        match self.save_active_workspace() {
             Ok(()) => self.last_notice = Some(format!("Saved workspace {}", path.display())),
             Err(error) => self.last_error = Some(format!("Unable to save workspace: {error}")),
         }
@@ -1395,6 +1594,7 @@ impl ViewerApp {
                     let search = ui.add_sized(
                         [search_width, 30.0],
                         egui::TextEdit::singleline(&mut self.filter.text)
+                            .vertical_align(egui::Align::Center)
                             .hint_text("Search messages, events, subsystems, or fields…"),
                     );
                     if search.changed() {
@@ -1523,8 +1723,37 @@ impl ViewerApp {
     }
 
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("Settings", |ui| {
+        egui::menu::MenuButton::new("Settings")
+            .config(
+                egui::menu::MenuConfig::new()
+                    .close_behavior(PopupCloseBehavior::CloseOnClickOutside),
+            )
+            .ui(ui, |ui| {
             ui.set_min_width(340.0);
+
+            ui.label(RichText::new("Interface").strong());
+            ui.horizontal(|ui| {
+                let scale_response = ui.add(
+                    egui::Slider::new(&mut self.ui_scale, MIN_UI_SCALE..=MAX_UI_SCALE)
+                        .text("Scale")
+                        .suffix("×")
+                        .step_by(0.05),
+                );
+                if scale_response.changed() {
+                    ui.ctx().set_zoom_factor(self.ui_scale);
+                }
+                if ui.small_button("Reset").clicked() {
+                    self.ui_scale = DEFAULT_UI_SCALE;
+                    ui.ctx().set_zoom_factor(self.ui_scale);
+                }
+            });
+            ui.label(
+                RichText::new("Adjust the size of the entire DeeBugee interface.")
+                    .small()
+                    .color(TEXT_MUTED),
+            );
+
+            ui.separator();
 
             ui.label(RichText::new("Live View").strong());
             if ui
@@ -1796,6 +2025,7 @@ impl ViewerApp {
             .any(|bookmark| bookmark.filter == self.filter);
         let bookmarks = self.bookmarks.clone();
         let mut apply_filter = None;
+        let mut overwrite_index = None;
         let mut remove_index = None;
 
         ui.horizontal_wrapped(|ui| {
@@ -1822,9 +2052,23 @@ impl ViewerApp {
             for (index, bookmark) in bookmarks.iter().enumerate() {
                 let response = ui
                     .selectable_label(bookmark.filter == self.filter, bookmark.name.clone())
-                    .on_hover_text("Click to apply; right-click to remove");
+                    .on_hover_text(
+                        "Click to apply; Ctrl+Alt+click to update from the current filters; \
+                         middle-click to rename; right-click to remove",
+                    );
                 if response.clicked() {
-                    apply_filter = Some(bookmark.filter.clone());
+                    let modifiers = ui.input(|input| input.modifiers);
+                    if modifiers.ctrl && modifiers.alt {
+                        overwrite_index = Some(index);
+                    } else {
+                        apply_filter = Some(bookmark.filter.clone());
+                    }
+                }
+                if response.clicked_by(PointerButton::Middle) {
+                    self.bookmark_rename = Some(BookmarkRename {
+                        index,
+                        name: bookmark.name.clone(),
+                    });
                 }
                 if response.clicked_by(PointerButton::Secondary) {
                     remove_index = Some(index);
@@ -1837,8 +2081,56 @@ impl ViewerApp {
             self.filter = filter;
             self.filter_changed();
         }
+        if let Some(index) = overwrite_index
+            && let Some(bookmark) = self.bookmarks.get_mut(index)
+        {
+            bookmark.filter = self.filter.clone();
+        }
         if let Some(index) = remove_index {
             self.bookmarks.remove(index);
+        }
+
+        self.bookmark_rename_dialog(ui.ctx());
+    }
+
+    fn bookmark_rename_dialog(&mut self, context: &egui::Context) {
+        let Some(rename) = self.bookmark_rename.as_mut() else {
+            return;
+        };
+
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Rename saved view")
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label("Name");
+                let name = ui.add(
+                    egui::TextEdit::singleline(&mut rename.name)
+                        .desired_width(260.0)
+                        .hint_text("Saved view name"),
+                );
+                name.request_focus();
+
+                ui.horizontal(|ui| {
+                    let can_save = !rename.name.trim().is_empty();
+                    save = ui
+                        .add_enabled(can_save, egui::Button::new("Save"))
+                        .clicked()
+                        || (can_save && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                    cancel = ui.button("Cancel").clicked()
+                        || ui.input(|input| input.key_pressed(egui::Key::Escape));
+                });
+            });
+
+        if save {
+            if let Some(rename) = self.bookmark_rename.take()
+                && let Some(bookmark) = self.bookmarks.get_mut(rename.index)
+            {
+                bookmark.name = rename.name.trim().to_owned();
+            }
+        } else if cancel {
+            self.bookmark_rename = None;
         }
     }
 
@@ -1989,14 +2281,36 @@ impl ViewerApp {
             let timestamp_display = self.timestamp_display;
             let timestamp_format = &self.timestamp_format;
             let scroll_to_bottom_requested = self.scroll_to_bottom_requested;
+            // Labels are normally selectable so log text can be copied. egui's
+            // selection handler treats every pointer button as a drag source,
+            // including the middle button we reserve for table panning.
+            let middle_pan_down = ui.input(|input| input.pointer.middle_down());
+            let table_pan_id = ui.make_persistent_id("events_middle_pan");
+            let middle_pan_started_here = ui.input(|input| {
+                input.pointer.button_pressed(PointerButton::Middle)
+                    && input.pointer.interact_pos().is_some_and(|position| {
+                        ui.available_rect_before_wrap().contains(position)
+                    })
+            });
+            if middle_pan_started_here {
+                // Claim the drag before TableBuilder creates resize handles or
+                // other draggable widgets. This makes the wheel button exclusive
+                // to panning for the full duration of the gesture.
+                ui.ctx().set_dragged_id(table_pan_id);
+            }
             let mut selected = self.selected_row;
             let mut requested_move = None;
             let table_content_width = ui.available_width().max(1_400.0);
-            let mut horizontal_output = egui::ScrollArea::horizontal()
-                .id_salt("events_horizontal_scroll")
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
+            let mut horizontal_output = ui
+                .scope(|ui| {
+                    if middle_pan_down {
+                        ui.style_mut().interaction.selectable_labels = false;
+                    }
+                    egui::ScrollArea::horizontal()
+                    .id_salt("events_horizontal_scroll")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                     ui.set_min_width(table_content_width);
                     let mut table = TableBuilder::new(ui)
                         .id_salt("events")
@@ -2177,7 +2491,9 @@ impl ViewerApp {
                                 }
                             });
                         })
-                });
+                    })
+                })
+                .inner;
 
             let (middle_pressed, middle_down, primary_down, middle_pointer_position, pointer_delta) =
                 ui.input(|input| {
@@ -2826,6 +3142,13 @@ impl eframe::App for ViewerApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Err(error) = self.save_active_workspace() {
+            self.last_error = Some(format!("Unable to save active workspace: {error}"));
+        }
+        let mut bookmarks_by_source = self.bookmarks_by_source.clone();
+        if let Some(scope) = &self.bookmark_scope {
+            bookmarks_by_source.insert(scope.clone(), self.bookmarks.clone());
+        }
         let preferences = ViewerPreferences {
             version: 1,
             sources: self.sources.clone(),
@@ -2836,11 +3159,13 @@ impl eframe::App for ViewerApp {
             stick_to_bottom: self.stick_to_bottom,
             color_by: self.color_by,
             bookmarks: self.bookmarks.clone(),
+            bookmarks_by_source,
             latest_at: self.latest_at,
             max_events: self.max_events,
             timestamp_display: self.timestamp_display,
             timestamp_format: self.timestamp_format.clone(),
             group_errors: self.group_errors,
+            ui_scale: self.ui_scale,
         };
         eframe::set_value(storage, PREFERENCES_KEY, &preferences);
     }
@@ -2908,6 +3233,71 @@ fn facet_title(facet: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn bookmark_scope_key(paths: &[PathBuf]) -> Option<String> {
+    let mut source_paths = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                continue;
+            };
+            source_paths.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|child| is_jsonl_path(child))
+                    .map(|child| child.canonicalize().unwrap_or(child)),
+            );
+        } else {
+            source_paths.push(path.canonicalize().unwrap_or_else(|_| path.clone()));
+        }
+    }
+    source_paths.sort();
+    source_paths.dedup();
+    (!source_paths.is_empty()).then(|| {
+        source_paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\u{1f}")
+    })
+}
+
+fn load_workspace(path: &Path) -> Result<WorkspaceConfig, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("Unable to read workspace {}: {error}", path.display()))?;
+    let workspace = toml::from_str::<WorkspaceConfig>(&text)
+        .map_err(|error| format!("Unable to parse workspace {}: {error}", path.display()))?;
+    if workspace.version != 1 {
+        return Err(format!(
+            "Unsupported workspace version {} in {}",
+            workspace.version,
+            path.display()
+        ));
+    }
+    Ok(workspace)
+}
+
+fn workspace_display_name(path: &Path) -> Option<String> {
+    let workspace_parent = path.parent()?;
+    let project_root = (workspace_parent.file_name()? == ".deebugee")
+        .then(|| workspace_parent.parent())
+        .flatten()
+        .unwrap_or(workspace_parent);
+    project_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+}
+
+fn is_jsonl_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            name.ends_with(".jsonl") || name.contains(".jsonl.")
+        })
 }
 
 fn stable_value_color(value: &str) -> Color32 {
@@ -3292,5 +3682,17 @@ mod tests {
         let name = bookmark_name(&filter);
         assert!(name.contains("Search: segment local"));
         assert!(name.contains("Subsystem: normalizer + player"));
+    }
+
+    #[test]
+    fn bookmark_scopes_are_stable_per_jsonl_source_set() {
+        let alpha = PathBuf::from("C:/logs/alpha.jsonl");
+        let beta = PathBuf::from("C:/logs/beta.jsonl");
+
+        assert_eq!(
+            bookmark_scope_key(&[alpha.clone(), beta.clone()]),
+            bookmark_scope_key(&[beta.clone(), alpha.clone()])
+        );
+        assert_ne!(bookmark_scope_key(&[alpha]), bookmark_scope_key(&[beta]));
     }
 }
