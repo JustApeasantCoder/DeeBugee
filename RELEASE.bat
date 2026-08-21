@@ -49,7 +49,7 @@ if /i not "%LOCAL_HEAD%"=="%REMOTE_HEAD%" (
     exit /b 1
 )
 
-for /f "delims=" %%V in ('powershell -NoProfile -Command "$content = Get-Content -Raw 'Cargo.toml'; $match = [regex]::Match($content, '(?m)^version\s*=\s*\"(?<version>\d+)\.(?<minor>\d+)\.(?<patch>\d+)\"\s*$'); if (-not $match.Success) { exit 1 }; '{0}.{1}.{2}' -f $match.Groups['version'].Value, $match.Groups['minor'].Value, (([int]$match.Groups['patch'].Value) + 1)"') do set "NEXT_VERSION=%%V"
+for /f "delims=" %%V in ('powershell -NoProfile -Command "$content = Get-Content -Raw 'Cargo.toml'; $match = [regex]::Match($content, '(?m)^version\s*=\s*\"\d+\.\d+\.\d+\"\s*$'); if (-not $match.Success) { exit 1 }; $parts = ($match.Value -replace '.*\"|\".*', '') -split '\.'; '{0}.{1}.{2}' -f $parts[0], $parts[1], (([int]$parts[2]) + 1)"') do set "NEXT_VERSION=%%V"
 if not defined NEXT_VERSION (
     echo Could not determine the next patch version from Cargo.toml.
     exit /b 1
@@ -65,7 +65,7 @@ if defined EXISTING_TAG (
 call "%~dp0BUILD.bat"
 if errorlevel 1 exit /b %errorlevel%
 
-for /f "delims=" %%V in ('powershell -NoProfile -Command "$content = Get-Content -Raw 'Cargo.toml'; $match = [regex]::Match($content, '(?m)^version\s*=\s*\"(?<version>\d+\.\d+\.\d+)\"\s*$'); if (-not $match.Success) { exit 1 }; $match.Groups['version'].Value"') do set "VERSION=%%V"
+for /f "delims=" %%V in ('powershell -NoProfile -Command "$content = Get-Content -Raw 'Cargo.toml'; $match = [regex]::Match($content, '(?m)^version\s*=\s*\"\d+\.\d+\.\d+\"\s*$'); if (-not $match.Success) { exit 1 }; $match.Value -replace '.*\"|\".*', ''"') do set "VERSION=%%V"
 if not defined VERSION (
     echo Could not read the release version from Cargo.toml.
     exit /b 1
