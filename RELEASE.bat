@@ -5,13 +5,22 @@ cd /d "%~dp0"
 rem Publishes a new patch release of DeeBugee and uploads the portable EXE.
 rem One-time setup: install GitHub CLI (https://cli.github.com/) and run "gh auth login".
 
+set "GH=gh"
 where gh >nul 2>nul
-if errorlevel 1 (
-    echo GitHub CLI ^(gh^) is required. Install it from https://cli.github.com/
-    exit /b 1
-)
+if not errorlevel 1 goto gh_ready
 
-gh auth status --hostname github.com >nul 2>nul
+set "GH=%ProgramFiles%\GitHub CLI\gh.exe"
+if exist "%GH%" goto gh_ready
+
+set "GH=%LOCALAPPDATA%\Programs\GitHub CLI\gh.exe"
+if exist "%GH%" goto gh_ready
+
+echo GitHub CLI ^(gh^) is required. Install it from https://cli.github.com/
+exit /b 1
+
+:gh_ready
+
+"%GH%" auth status --hostname github.com >nul 2>nul
 if errorlevel 1 (
     echo GitHub CLI is not authenticated. Run: gh auth login
     exit /b 1
@@ -81,7 +90,7 @@ if errorlevel 1 exit /b %errorlevel%
 git push origin main
 if errorlevel 1 exit /b %errorlevel%
 
-gh release create "%TAG%" "%ASSET%#dee-bugee.exe" --title "DeeBugee %TAG%" --generate-notes --target main
+"%GH%" release create "%TAG%" "%ASSET%#dee-bugee.exe" --title "DeeBugee %TAG%" --generate-notes --target main
 if errorlevel 1 exit /b %errorlevel%
 
 echo.
