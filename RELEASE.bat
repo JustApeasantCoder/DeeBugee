@@ -81,7 +81,7 @@ if not exist "%ASSET%" (
 git diff --check
 if errorlevel 1 exit /b %errorlevel%
 
-git add Cargo.toml adapters\electron\package.json adapters\electron\package-lock.json adapters\dotnet\DeeBugee.Extensions.Logging\DeeBugee.Extensions.Logging.csproj
+git add Cargo.toml Cargo.lock adapters\electron\package.json adapters\electron\package-lock.json adapters\dotnet\DeeBugee.Extensions.Logging\DeeBugee.Extensions.Logging.csproj
 if errorlevel 1 exit /b %errorlevel%
 
 git commit -m "chore: release %TAG%"
