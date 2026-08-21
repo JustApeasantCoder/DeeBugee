@@ -120,6 +120,21 @@ DeeBugee discovers `.deebugee/project.toml`, loads the configured sources, and s
 
 Use `--project <path>` when launching from outside the project directory. `--logs <path>` can be repeated to temporarily override the manifest's sources. `--workspace <path>` remains available for opening or creating an explicit standalone workspace and cannot be combined with `--project`.
 
+## AI agent skills
+
+[![skills.sh](https://skills.sh/b/JustApeasantCoder/DeeBugee)](https://skills.sh/JustApeasantCoder/DeeBugee)
+
+Install the published DeeBugee skills for compatible coding agents with
+[skills.sh](https://www.skills.sh/):
+
+```powershell
+# Structured JSONL diagnosis, instrumentation, and DeeBugee development
+npx skills add JustApeasantCoder/DeeBugee --skill deebugee
+
+# Shared viewer installation and project-manifest onboarding
+npx skills add JustApeasantCoder/DeeBugee --skill deebugee-project-install
+```
+
 ## Using DeeBugee
 
 ### Search and filtering
