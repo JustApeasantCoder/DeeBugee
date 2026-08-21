@@ -87,7 +87,15 @@ Cloning this repository is only for contributing to DeeBugee; application develo
 
 ### Configure a project
 
-An application repository can commit a small `.deebugee/project.toml` manifest:
+From the application repository, launch DeeBugee in project mode:
+
+```powershell
+dee-bugee.exe --project .
+```
+
+When the project does not have a manifest yet, DeeBugee opens a native setup screen. Confirm the suggested project name and stable ID, then add one or more JSONL files or folders. Paths selected inside the repository are saved relative to the project, and paths under Local AppData are saved with `%LOCALAPPDATA%` automatically. Sources that the application has not created yet are allowed.
+
+Saving creates the small, shareable `.deebugee/project.toml` manifest and opens the project immediately:
 
 ```toml
 version = 1
@@ -101,13 +109,14 @@ sources = [
 
 Environment variables use Windows `%NAME%` syntax. Relative sources resolve from the project root. Each source must be a JSONL file or a directory containing JSONL files.
 
-From a cloned application repository, run:
+After the first setup, launch from a cloned application repository with either:
 
 ```powershell
 dee-bugee.exe .
+dee-bugee.exe --project .
 ```
 
-DeeBugee discovers `.deebugee/project.toml`, loads the configured sources, and stores that developer's filters, bookmarks, layout, and other workspace state privately under `%LOCALAPPDATA%\DeeBugee\projects`. The repository contains no DeeBugee executable, launcher scripts, or personal workspace file.
+DeeBugee discovers `.deebugee/project.toml`, loads the configured sources, and stores that developer's filters, bookmarks, layout, and other workspace state privately under `%LOCALAPPDATA%\DeeBugee\projects`. Use **Project → Configure Project…** to edit an existing manifest; DeeBugee asks for confirmation before replacing it. The repository contains no DeeBugee executable, launcher scripts, or personal workspace file.
 
 Use `--project <path>` when launching from outside the project directory. `--logs <path>` can be repeated to temporarily override the manifest's sources. `--workspace <path>` remains available for opening or creating an explicit standalone workspace and cannot be combined with `--project`.
 

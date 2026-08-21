@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fs::OpenOptions,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
@@ -96,7 +97,7 @@ impl LaunchRequest {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ProjectConfig {
     version: u16,
     id: String,
@@ -107,6 +108,64 @@ struct ProjectConfig {
 struct ProjectLaunch {
     workspace_path: PathBuf,
     sources: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectSetup {
+    root: PathBuf,
+    name: String,
+    id: String,
+    sources: Vec<String>,
+    editing_existing: bool,
+    confirm_overwrite: bool,
+    error: Option<String>,
+}
+
+impl ProjectSetup {
+    fn new(root: PathBuf) -> Self {
+        let root = root.canonicalize().unwrap_or(root);
+        let name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("My Application")
+            .to_string();
+        let id = suggested_project_id(&root, &name);
+        Self {
+            root,
+            name,
+            id,
+            sources: vec![String::new()],
+            editing_existing: false,
+            confirm_overwrite: false,
+            error: None,
+        }
+    }
+
+    fn from_config(root: PathBuf, config: ProjectConfig) -> Self {
+        Self {
+            root,
+            name: config.name,
+            id: config.id,
+            sources: config.sources,
+            editing_existing: true,
+            confirm_overwrite: false,
+            error: None,
+        }
+    }
+
+    fn config(&self) -> ProjectConfig {
+        ProjectConfig {
+            version: 1,
+            id: self.id.trim().to_string(),
+            name: self.name.trim().to_string(),
+            sources: self
+                .sources
+                .iter()
+                .map(|source| source.trim().to_string())
+                .filter(|source| !source.is_empty())
+                .collect(),
+        }
+    }
 }
 
 fn project_display_name(path: &Path) -> Option<String> {
@@ -141,6 +200,12 @@ fn project_manifest_path(path: &Path) -> PathBuf {
     }
 }
 
+fn project_root(path: &Path) -> PathBuf {
+    let manifest_path = project_manifest_path(path);
+    let root = project_root_from_manifest(&manifest_path).unwrap_or_else(|_| path.to_path_buf());
+    root.canonicalize().unwrap_or(root)
+}
+
 fn project_root_from_manifest(manifest_path: &Path) -> Result<PathBuf, String> {
     let manifest_parent = manifest_path
         .parent()
@@ -166,18 +231,30 @@ fn project_root_from_manifest(manifest_path: &Path) -> Result<PathBuf, String> {
 fn load_project(path: &Path) -> Result<ProjectLaunch, String> {
     let manifest_path = project_manifest_path(path);
     let project_root = project_root_from_manifest(&manifest_path)?;
-    let text = std::fs::read_to_string(&manifest_path).map_err(|error| {
+    let config = load_project_config(&manifest_path)?;
+    project_launch_from_config(&project_root, &manifest_path, &config)
+}
+
+fn load_project_config(manifest_path: &Path) -> Result<ProjectConfig, String> {
+    let text = std::fs::read_to_string(manifest_path).map_err(|error| {
         format!(
             "Unable to read project manifest {}: {error}",
             manifest_path.display()
         )
     })?;
-    let config = toml::from_str::<ProjectConfig>(&text).map_err(|error| {
+    toml::from_str::<ProjectConfig>(&text).map_err(|error| {
         format!(
             "Unable to parse project manifest {}: {error}",
             manifest_path.display()
         )
-    })?;
+    })
+}
+
+fn project_launch_from_config(
+    project_root: &Path,
+    manifest_path: &Path,
+    config: &ProjectConfig,
+) -> Result<ProjectLaunch, String> {
     if config.version != 1 {
         return Err(format!(
             "Unsupported project manifest version {} in {}",
@@ -200,15 +277,7 @@ fn load_project(path: &Path) -> Result<ProjectLaunch, String> {
     let sources = config
         .sources
         .iter()
-        .map(|source| {
-            let expanded = expand_environment_variables(source, |name| std::env::var_os(name))?;
-            let path = PathBuf::from(expanded);
-            Ok(if path.is_absolute() {
-                path
-            } else {
-                project_root.join(path)
-            })
-        })
+        .map(|source| resolve_project_source(project_root, source))
         .collect::<Result<Vec<_>, String>>()?;
     let local_app_data = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| "LOCALAPPDATA is unavailable; cannot store project workspace".to_string())?;
@@ -221,6 +290,173 @@ fn load_project(path: &Path) -> Result<ProjectLaunch, String> {
         workspace_path,
         sources,
     })
+}
+
+fn resolve_project_source(project_root: &Path, source: &str) -> Result<PathBuf, String> {
+    let expanded = expand_environment_variables(source, |name| std::env::var_os(name))?;
+    let path = PathBuf::from(expanded);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        project_root.join(path)
+    })
+}
+
+fn write_project_manifest(
+    root: &Path,
+    config: &ProjectConfig,
+    overwrite: bool,
+) -> Result<PathBuf, String> {
+    let manifest_path = project_manifest_path(root);
+    project_launch_from_config(root, &manifest_path, config)?;
+    let parent = manifest_path
+        .parent()
+        .ok_or_else(|| format!("Project manifest {} has no parent", manifest_path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "Unable to create project configuration folder {}: {error}",
+            parent.display()
+        )
+    })?;
+    let text = toml::to_string_pretty(config)
+        .map_err(|error| format!("Unable to serialize project manifest: {error}"))?;
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if overwrite {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    let mut file = options.open(&manifest_path).map_err(|error| {
+        format!(
+            "Unable to create project manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    file.write_all(text.as_bytes()).map_err(|error| {
+        format!(
+            "Unable to write project manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    file.flush().map_err(|error| {
+        format!(
+            "Unable to flush project manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(manifest_path)
+}
+
+fn manifest_source_path(project_root: &Path, selected_path: &Path) -> String {
+    let selected = selected_path
+        .canonicalize()
+        .unwrap_or_else(|_| selected_path.to_path_buf());
+    let root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    if let Ok(relative) = selected.strip_prefix(&root) {
+        return if relative.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            portable_path(relative)
+        };
+    }
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let local_app_data = PathBuf::from(local_app_data);
+        let local_app_data = local_app_data.canonicalize().unwrap_or(local_app_data);
+        if let Ok(relative) = selected.strip_prefix(local_app_data) {
+            let relative = portable_path(relative);
+            return if relative.is_empty() {
+                "%LOCALAPPDATA%".to_string()
+            } else {
+                format!("%LOCALAPPDATA%/{relative}")
+            };
+        }
+    }
+    portable_path(&selected)
+}
+
+fn portable_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn display_path(path: &Path) -> String {
+    let path = path.display().to_string();
+    if let Some(network_path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{network_path}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
+    }
+}
+
+fn add_project_source(sources: &mut Vec<String>, source: String) {
+    if let Some(empty_source) = sources.iter_mut().find(|source| source.trim().is_empty()) {
+        *empty_source = source;
+    } else {
+        sources.push(source);
+    }
+}
+
+fn suggested_project_id(root: &Path, project_name: &str) -> String {
+    git_origin_url(root)
+        .as_deref()
+        .and_then(project_id_from_remote)
+        .unwrap_or_else(|| format!("local.{}", id_component(project_name)))
+}
+
+fn git_origin_url(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(".git").join("config")).ok()?;
+    let mut in_origin = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_origin = line.eq_ignore_ascii_case("[remote \"origin\"]");
+        } else if in_origin
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("url")
+        {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+fn project_id_from_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/').trim_end_matches(".git");
+    let (host, path) = if let Some((_, remainder)) = remote.split_once("://") {
+        let (authority, path) = remainder.split_once('/')?;
+        (
+            authority.rsplit('@').next()?.split(':').next()?,
+            path.to_string(),
+        )
+    } else {
+        let (authority, path) = remote.split_once(':')?;
+        (authority.rsplit('@').next()?, path.to_string())
+    };
+    let parts = host
+        .split('.')
+        .rev()
+        .chain(path.split('/'))
+        .map(id_component)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("."))
+}
+
+fn id_component(value: &str) -> String {
+    let mut result = String::new();
+    let mut previous_was_separator = false;
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            result.push(character);
+            previous_was_separator = false;
+        } else if !previous_was_separator && !result.is_empty() {
+            result.push('-');
+            previous_was_separator = true;
+        }
+    }
+    result.trim_matches('-').to_string()
 }
 
 fn expand_environment_variables<F>(value: &str, mut lookup: F) -> Result<String, String>
@@ -954,6 +1190,8 @@ pub struct ViewerApp {
     reader: ReaderHandle,
     sources: Vec<PathBuf>,
     workspace_path: Option<PathBuf>,
+    project_root: Option<PathBuf>,
+    project_setup: Option<ProjectSetup>,
     selected_row: Option<usize>,
     invalid_records: u64,
     last_error: Option<String>,
@@ -1009,13 +1247,39 @@ impl ViewerApp {
             .egui_ctx
             .set_zoom_factor(preferences.ui_scale);
 
-        let (project_workspace_path, project_sources, project_error) =
-            match launch.project_root.as_deref() {
-                Some(path) => match load_project(path) {
-                    Ok(project) => (Some(project.workspace_path), Some(project.sources), None),
-                    Err(error) => (None, None, Some(error)),
+        let active_project_root = launch.project_root.as_deref().map(project_root);
+        let (project_workspace_path, project_sources, project_error, project_setup) =
+            match active_project_root.as_deref() {
+                Some(root) if project_manifest_path(root).is_file() => match load_project(root) {
+                    Ok(project) => (
+                        Some(project.workspace_path),
+                        Some(project.sources),
+                        None,
+                        None,
+                    ),
+                    Err(error) => (None, None, Some(error), None),
                 },
-                None => (None, None, None),
+                Some(root) if root.is_dir() => {
+                    let mut setup = ProjectSetup::new(root.to_path_buf());
+                    if !launch.log_paths.is_empty() {
+                        setup.sources = launch
+                            .log_paths
+                            .iter()
+                            .map(|path| manifest_source_path(root, path))
+                            .collect();
+                    }
+                    (None, None, None, Some(setup))
+                }
+                Some(root) => (
+                    None,
+                    None,
+                    Some(format!(
+                        "Project root {} is not an existing directory",
+                        root.display()
+                    )),
+                    None,
+                ),
+                None => (None, None, None, None),
             };
         let conflicting_targets = launch.project_root.is_some() && launch.workspace_path.is_some();
         let requested_workspace_path = project_workspace_path.or(launch.workspace_path);
@@ -1121,6 +1385,8 @@ impl ViewerApp {
             // completed its first poll, so a newly created workspace is durable.
             sources: paths_to_open,
             workspace_path,
+            project_root: active_project_root,
+            project_setup,
             selected_row: None,
             invalid_records: 0,
             last_error: startup_error,
@@ -1671,6 +1937,303 @@ impl ViewerApp {
         }
     }
 
+    fn open_project_configuration(&mut self) {
+        let Some(root) = self.project_root.clone() else {
+            return;
+        };
+        let manifest_path = project_manifest_path(&root);
+        match load_project_config(&manifest_path) {
+            Ok(config) => self.project_setup = Some(ProjectSetup::from_config(root, config)),
+            Err(error) => {
+                self.last_error = Some(format!("Unable to configure project: {error}"));
+            }
+        }
+    }
+
+    fn save_project_setup(&mut self, setup: &ProjectSetup) -> Result<(), String> {
+        let config = setup.config();
+        let manifest_path = write_project_manifest(&setup.root, &config, setup.editing_existing)?;
+        let project = load_project(&setup.root)?;
+        self.project_root = Some(setup.root.clone());
+        self.workspace_path = Some(project.workspace_path);
+        self.replace_paths(project.sources);
+        if let Err(error) = self.save_active_workspace() {
+            self.last_error = Some(format!(
+                "Project was created, but its workspace failed: {error}"
+            ));
+        }
+        self.last_notice = Some(format!(
+            "Configured {} with {} log source{}",
+            manifest_path.display(),
+            config.sources.len(),
+            if config.sources.len() == 1 { "" } else { "s" }
+        ));
+        Ok(())
+    }
+
+    fn project_setup_screen(&mut self, root: &mut egui::Ui) {
+        let Some(mut setup) = self.project_setup.take() else {
+            return;
+        };
+        let mut save_now = false;
+        let mut cancel = false;
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(SURFACE_0))
+            .show(root, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(28.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("{  }").monospace().size(32.0).color(ACCENT));
+                        ui.heading(if setup.editing_existing {
+                            "Configure Project"
+                        } else {
+                            "Set Up This Project"
+                        });
+                        ui.label(
+                            RichText::new(display_path(&setup.root))
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                    });
+                    ui.add_space(20.0);
+
+                    let available = ui.available_width();
+                    let form_width = available.min(780.0);
+                    let left_margin = ((available - form_width) / 2.0).max(0.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(left_margin);
+                        ui.vertical(|ui| {
+                            ui.set_width(form_width);
+                            egui::Frame::new()
+                                .fill(SURFACE_1)
+                                .stroke(Stroke::new(1.0, BORDER))
+                                .corner_radius(8.0)
+                                .inner_margin(egui::Margin::same(20))
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new("Project name").strong());
+                                    if ui
+                                        .add_sized(
+                                            [ui.available_width(), 30.0],
+                                            egui::TextEdit::singleline(&mut setup.name),
+                                        )
+                                        .changed()
+                                    {
+                                        setup.confirm_overwrite = false;
+                                        setup.error = None;
+                                    }
+                                    ui.add_space(12.0);
+
+                                    ui.label(RichText::new("Project ID").strong());
+                                    if ui
+                                        .add_sized(
+                                            [ui.available_width(), 30.0],
+                                            egui::TextEdit::singleline(&mut setup.id)
+                                                .font(TextStyle::Monospace),
+                                        )
+                                        .changed()
+                                    {
+                                        setup.confirm_overwrite = false;
+                                        setup.error = None;
+                                    }
+                                    ui.label(
+                                        RichText::new(
+                                            "Keep this stable across clones; it identifies private workspace state.",
+                                        )
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                    );
+                                    ui.add_space(18.0);
+
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Log sources").strong());
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("Add Folder…").clicked()
+                                                    && let Some(path) = rfd::FileDialog::new()
+                                                        .set_directory(&setup.root)
+                                                        .pick_folder()
+                                                {
+                                                    add_project_source(
+                                                        &mut setup.sources,
+                                                        manifest_source_path(&setup.root, &path),
+                                                    );
+                                                    setup.confirm_overwrite = false;
+                                                    setup.error = None;
+                                                }
+                                                if ui.button("Add File…").clicked()
+                                                    && let Some(path) = rfd::FileDialog::new()
+                                                        .set_directory(&setup.root)
+                                                        .add_filter(
+                                                            "JSON Lines",
+                                                            &["jsonl", "log"],
+                                                        )
+                                                        .pick_file()
+                                                {
+                                                    add_project_source(
+                                                        &mut setup.sources,
+                                                        manifest_source_path(&setup.root, &path),
+                                                    );
+                                                    setup.confirm_overwrite = false;
+                                                    setup.error = None;
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "Use a JSONL file or a folder containing JSONL files. Paths may point to logs that are created later.",
+                                        )
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                    );
+                                    ui.add_space(8.0);
+
+                                    let mut remove_source = None;
+                                    for (index, source) in setup.sources.iter_mut().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add_sized(
+                                                    [ui.available_width() - 72.0, 28.0],
+                                                    egui::TextEdit::singleline(source)
+                                                        .font(TextStyle::Monospace)
+                                                        .hint_text(
+                                                            "%LOCALAPPDATA%/MyApplication/logs",
+                                                        ),
+                                                )
+                                                .changed()
+                                            {
+                                                setup.confirm_overwrite = false;
+                                                setup.error = None;
+                                            }
+                                            if ui.button("Remove").clicked() {
+                                                remove_source = Some(index);
+                                            }
+                                        });
+                                        if !source.trim().is_empty() {
+                                            match resolve_project_source(&setup.root, source.trim()) {
+                                                Ok(path) if path.exists() => {
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "Ready: {}",
+                                                            display_path(&path)
+                                                        ))
+                                                        .small()
+                                                        .color(SUCCESS),
+                                                    );
+                                                }
+                                                Ok(path) => {
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "Not created yet: {}",
+                                                            display_path(&path)
+                                                        ))
+                                                        .small()
+                                                        .color(WARNING),
+                                                    );
+                                                }
+                                                Err(error) => {
+                                                    ui.label(
+                                                        RichText::new(error).small().color(DANGER),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        ui.add_space(6.0);
+                                    }
+                                    if let Some(index) = remove_source {
+                                        setup.sources.remove(index);
+                                        setup.confirm_overwrite = false;
+                                        setup.error = None;
+                                    }
+                                    if ui.button("+ Add another source").clicked() {
+                                        setup.sources.push(String::new());
+                                        setup.confirm_overwrite = false;
+                                        setup.error = None;
+                                    }
+
+                                    if let Some(error) = &setup.error {
+                                        ui.add_space(12.0);
+                                        ui.label(RichText::new(error).color(DANGER));
+                                    }
+                                    ui.add_space(18.0);
+                                    ui.separator();
+                                    ui.add_space(12.0);
+
+                                    let can_save = !setup.name.trim().is_empty()
+                                        && !setup.id.trim().is_empty()
+                                        && setup.sources.iter().any(|source| !source.trim().is_empty());
+                                    ui.horizontal(|ui| {
+                                        if setup.confirm_overwrite {
+                                            ui.label(
+                                                RichText::new(
+                                                    "Replace the existing project manifest?",
+                                                )
+                                                .color(WARNING),
+                                            );
+                                            if ui
+                                                .add_enabled(
+                                                    can_save,
+                                                    egui::Button::new("Overwrite Manifest"),
+                                                )
+                                                .clicked()
+                                            {
+                                                save_now = true;
+                                            }
+                                            if ui.button("Keep Existing").clicked() {
+                                                setup.confirm_overwrite = false;
+                                            }
+                                        } else {
+                                            let save_label = if setup.editing_existing {
+                                                "Save Changes"
+                                            } else {
+                                                "Create Project Configuration"
+                                            };
+                                            if ui
+                                                .add_enabled(can_save, egui::Button::new(save_label))
+                                                .clicked()
+                                            {
+                                                if setup.editing_existing {
+                                                    setup.confirm_overwrite = true;
+                                                } else {
+                                                    save_now = true;
+                                                }
+                                            }
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            cancel = true;
+                                        }
+                                    });
+                                });
+                        });
+                    });
+                });
+            });
+
+        if cancel {
+            if !setup.editing_existing {
+                self.project_root = None;
+                self.last_notice = Some("Project setup cancelled".to_string());
+            }
+            return;
+        }
+        if save_now {
+            match self.save_project_setup(&setup) {
+                Ok(()) => {
+                    root.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                            "DeeBugee — {}",
+                            setup.name.trim()
+                        )));
+                    return;
+                }
+                Err(error) => setup.error = Some(error),
+            }
+        }
+        self.project_setup = Some(setup);
+    }
+
     fn export_filtered(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("JSON Lines", &["jsonl"])
@@ -1758,6 +2321,14 @@ impl ViewerApp {
                             ui.close();
                         }
                     });
+                    if self.project_root.is_some() {
+                        ui.menu_button("Project", |ui| {
+                            if ui.button("Configure Project…").clicked() {
+                                self.open_project_configuration();
+                                ui.close();
+                            }
+                        });
+                    }
                     self.settings_menu(ui);
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3288,6 +3859,12 @@ fn can_refresh_filtered_rows_immediately(
 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.project_setup.is_some() {
+            self.project_setup_screen(ui);
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+            return;
+        }
+
         self.drain_reader();
         self.drain_search_results();
 
@@ -3931,5 +4508,79 @@ sources = ["logs"]
                 .unwrap_err()
                 .contains("%MISSING%")
         );
+    }
+
+    #[test]
+    fn project_ids_are_suggested_from_common_git_remote_shapes() {
+        assert_eq!(
+            project_id_from_remote("https://github.com/ExampleOrg/MyApp.git").as_deref(),
+            Some("com.github.exampleorg.myapp")
+        );
+        assert_eq!(
+            project_id_from_remote("git@github.com:ExampleOrg/MyApp.git").as_deref(),
+            Some("com.github.exampleorg.myapp")
+        );
+        assert_eq!(
+            project_id_from_remote("ssh://git@git.example.dev/Team/My App.git").as_deref(),
+            Some("dev.example.git.team.my-app")
+        );
+    }
+
+    #[test]
+    fn selected_project_sources_are_saved_as_portable_relative_paths() {
+        let root =
+            std::env::temp_dir().join(format!("dee-bugee-project-source-{}", std::process::id()));
+        let logs = root.join("logs").join("development");
+        std::fs::create_dir_all(&logs).unwrap();
+
+        assert_eq!(manifest_source_path(&root, &logs), "logs/development");
+        assert_eq!(manifest_source_path(&root, &root), ".");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_setup_hides_windows_verbatim_path_prefixes() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\work\MyApp")),
+            r"C:\work\MyApp"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\logs\MyApp")),
+            r"\\server\logs\MyApp"
+        );
+    }
+
+    #[test]
+    fn picked_source_reuses_the_initial_empty_row() {
+        let mut sources = vec![String::new()];
+        add_project_source(&mut sources, "logs".to_string());
+        assert_eq!(sources, vec!["logs"]);
+
+        add_project_source(&mut sources, "other.jsonl".to_string());
+        assert_eq!(sources, vec!["logs", "other.jsonl"]);
+    }
+
+    #[test]
+    fn project_manifest_creation_refuses_an_unconfirmed_overwrite() {
+        let root =
+            std::env::temp_dir().join(format!("dee-bugee-project-write-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = ProjectConfig {
+            version: 1,
+            id: "com.example.write-test".to_string(),
+            name: "Write Test".to_string(),
+            sources: vec!["logs".to_string()],
+        };
+
+        let manifest = write_project_manifest(&root, &config, false).unwrap();
+        assert!(write_project_manifest(&root, &config, false).is_err());
+
+        config.name = "Updated Write Test".to_string();
+        write_project_manifest(&root, &config, true).unwrap();
+        let saved = load_project_config(&manifest).unwrap();
+        assert_eq!(saved.name, "Updated Write Test");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
