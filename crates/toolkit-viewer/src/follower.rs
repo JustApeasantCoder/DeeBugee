@@ -40,6 +40,7 @@ pub enum ReaderMessage {
         error: String,
     },
     SourceOpened(PathBuf),
+    SourceRecovered(PathBuf),
     SourceReplaced(PathBuf),
     SourceError {
         path: PathBuf,
@@ -85,20 +86,31 @@ fn reader_loop(
         }
 
         for (path, cursor) in &mut sources {
-            if let Err(error) = cursor.poll(path, &messages) {
-                if cursor.last_error.as_deref() != Some(&error) {
-                    let _ = messages.send(ReaderMessage::SourceError {
-                        path: path.clone(),
-                        error: error.clone(),
-                    });
-                    cursor.last_error = Some(error);
-                }
-            } else {
-                cursor.last_error = None;
-            }
+            poll_source(path, cursor, &messages);
         }
 
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn poll_source(path: &Path, cursor: &mut FileCursor, messages: &Sender<ReaderMessage>) {
+    let previous_error = cursor.last_error.clone();
+    match cursor.poll(path, messages) {
+        Err(error) => {
+            if previous_error.as_deref() != Some(&error) {
+                let _ = messages.send(ReaderMessage::SourceError {
+                    path: path.to_path_buf(),
+                    error: error.clone(),
+                });
+            }
+            cursor.last_error = Some(error);
+        }
+        Ok(()) => {
+            cursor.last_error = None;
+            if previous_error.is_some() {
+                let _ = messages.send(ReaderMessage::SourceRecovered(path.to_path_buf()));
+            }
+        }
     }
 }
 
@@ -445,6 +457,35 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(archive);
+    }
+
+    #[test]
+    fn successful_poll_reports_recovery_after_a_transient_source_error() {
+        let path = std::env::temp_dir().join(format!(
+            "dee-bugee-follower-recovery-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (sender, receiver) = bounded(8);
+        let mut cursor = FileCursor::default();
+
+        poll_source(&path, &mut cursor, &sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ReaderMessage::SourceError { .. })
+        ));
+
+        std::fs::write(&path, "").unwrap();
+        poll_source(&path, &mut cursor, &sender);
+        let messages = receiver.try_iter().collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, ReaderMessage::SourceRecovered(recovered) if recovered == &path))
+        );
+        assert!(cursor.last_error.is_none());
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

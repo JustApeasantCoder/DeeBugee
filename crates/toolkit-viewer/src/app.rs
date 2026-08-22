@@ -983,6 +983,7 @@ struct BookmarkRename {
 struct ErrorGroup {
     count: usize,
     first_index: usize,
+    previous_index: Option<usize>,
     latest_index: usize,
 }
 
@@ -1203,6 +1204,7 @@ impl SessionComparisonRow {
             || self.errors_a != self.errors_b
             || self.status_a != self.status_b
             || duration_changed(self.average_duration_a, self.average_duration_b)
+            || duration_changed(self.max_duration_a, self.max_duration_b)
     }
 
     fn significance(&self) -> (bool, usize, usize) {
@@ -1263,6 +1265,15 @@ fn compare_sessions(left: &SessionSummary, right: &SessionSummary) -> Vec<Sessio
             .then_with(|| left.event.cmp(&right.event))
     });
     rows
+}
+
+fn session_start_times(
+    summaries: &BTreeMap<String, SessionSummary>,
+) -> BTreeMap<String, DateTime<Utc>> {
+    summaries
+        .iter()
+        .map(|(id, summary)| (id.clone(), summary.first_timestamp))
+        .collect()
 }
 
 impl TableColumn {
@@ -2049,6 +2060,16 @@ impl ViewerApp {
                         detail: None,
                     });
                 }
+                Ok(ReaderMessage::SourceRecovered(path)) => {
+                    let health = self.source_health.entry(path).or_insert(SourceHealth {
+                        state: SourceHealthState::Tailing,
+                        parse_errors: 0,
+                        rotations: 0,
+                        detail: None,
+                    });
+                    health.state = SourceHealthState::Tailing;
+                    health.detail = Some("Reader recovered after a transient error".to_owned());
+                }
                 Ok(ReaderMessage::SourceReplaced(path)) => {
                     let health = self.source_health.entry(path).or_insert(SourceHealth {
                         state: SourceHealthState::Rotated,
@@ -2275,6 +2296,7 @@ impl ViewerApp {
             let group = groups.entry(key).or_insert(ErrorGroup {
                 count: 0,
                 first_index: *index,
+                previous_index: None,
                 latest_index: *index,
             });
             group.count += 1;
@@ -2284,6 +2306,9 @@ impl ViewerApp {
                 self.table_rows.push(*index);
             } else {
                 group.first_index = *index;
+                if group.count == 2 {
+                    group.previous_index = Some(*index);
+                }
             }
         }
 
@@ -2310,10 +2335,14 @@ impl ViewerApp {
                     .or_insert(ErrorGroup {
                         count: 0,
                         first_index: *index,
+                        previous_index: None,
                         latest_index: *index,
                     });
                 group.count += 1;
                 group.first_index = *index;
+                if group.count == 2 {
+                    group.previous_index = Some(*index);
+                }
             }
             for group in reverse_groups.into_values() {
                 self.error_groups.insert(group.latest_index, group);
@@ -3069,13 +3098,19 @@ impl ViewerApp {
     }
 
     fn select_event_key(&mut self, key: &str) -> bool {
-        let Some(index) = self.table_rows.iter().copied().find(|index| {
-            self.store
-                .get(*index)
-                .is_some_and(|event| event_pin_key(event) == key)
-        }) else {
+        let Some(index) = event_index_by_key(&self.store, key) else {
+            self.last_error =
+                Some("Pinned event is no longer retained in the loaded logs".to_owned());
             return false;
         };
+        if !self.table_rows.contains(&index) {
+            self.filter.clear();
+            self.refresh_filters();
+            if self.group_errors && !self.table_rows.contains(&index) {
+                self.group_errors = false;
+                self.rebuild_table_rows();
+            }
+        }
         self.selected_row = Some(index);
         self.scroll_to_selected_requested = true;
         self.scroll_to_bottom_requested = false;
@@ -3104,10 +3139,24 @@ impl ViewerApp {
     }
 
     fn navigate_pin(&mut self, direction: i32) {
-        let keys: BTreeSet<String> = self.pins.iter().map(|pin| pin.key.clone()).collect();
-        self.navigate_matching(direction, |event| {
-            keys.contains(event_pin_key(event).as_str())
-        });
+        let keys: Vec<String> = self
+            .pins
+            .iter()
+            .filter(|pin| event_index_by_key(&self.store, &pin.key).is_some())
+            .map(|pin| pin.key.clone())
+            .collect();
+        if keys.is_empty() {
+            self.last_error = Some("No pinned events remain in the loaded logs".to_owned());
+            return;
+        }
+        let current_key = self.selected_pin_key();
+        let current = current_key
+            .as_ref()
+            .and_then(|key| keys.iter().position(|candidate| candidate == key));
+        let len = keys.len() as i32;
+        let start = current.map_or(if direction > 0 { -1 } else { 0 }, |value| value as i32);
+        let position = (start + direction).rem_euclid(len) as usize;
+        self.select_event_key(&keys[position]);
     }
 
     fn handle_keyboard_navigation(&mut self, context: &egui::Context) {
@@ -4437,12 +4486,7 @@ impl ViewerApp {
         self.session_explorer.compare_a = compare_a;
         self.session_explorer.compare_b = compare_b;
         if let Some(session_id) = filter_session {
-            self.filter.correlation = None;
-            self.filter
-                .facets
-                .entry("app_session_id".to_string())
-                .or_default()
-                .include_only(session_id);
+            apply_session_filter(&mut self.filter, session_id);
             self.filter_changed();
         }
     }
@@ -4497,15 +4541,7 @@ impl ViewerApp {
             let selected_scroll_row = self.selected_row.and_then(|selected| {
                 self.table_rows.iter().position(|row| *row == selected)
             });
-            let mut session_starts = BTreeMap::<String, DateTime<Utc>>::new();
-            for index in table_rows {
-                if let Some(event) = store.get(*index) {
-                    session_starts
-                        .entry(event.app_session_id.clone())
-                        .and_modify(|timestamp| *timestamp = (*timestamp).min(event.timestamp))
-                        .or_insert(event.timestamp);
-                }
-            }
+            let session_starts = session_start_times(&self.session_explorer.summaries);
             // Labels are normally selectable so log text can be copied. egui's
             // selection handler treats every pointer button as a drag source,
             // including the middle button we reserve for table panning.
@@ -5105,6 +5141,14 @@ fn event_pin_key(event: &LogEvent) -> String {
     format!("{hash:016x}")
 }
 
+fn event_index_by_key(store: &EventStore, key: &str) -> Option<usize> {
+    (0..store.len()).find(|index| {
+        store
+            .get(*index)
+            .is_some_and(|event| event_pin_key(event) == key)
+    })
+}
+
 fn format_relative_elapsed(duration: chrono::Duration) -> String {
     let milliseconds = duration.num_milliseconds();
     let sign = if milliseconds < 0 { "-" } else { "+" };
@@ -5181,12 +5225,13 @@ fn error_group_summary(
             .get(group.first_index)
             .map(|event| timestamp_display.format(event, timestamp_format))
             .unwrap_or_else(|| "unknown".to_string());
-        let latest = store
-            .get(group.latest_index)
+        let last = group
+            .previous_index
+            .and_then(|index| store.get(index))
             .map(|event| timestamp_display.format(event, timestamp_format))
             .unwrap_or_else(|| "unknown".to_string());
         format!(
-            "Repeated {} times · first {first} · latest {latest}",
+            "Repeated {} times · first {first} · last {last}",
             group.count
         )
     })
@@ -5712,6 +5757,15 @@ fn toggle_session_choice(
     }
 }
 
+fn apply_session_filter(filter: &mut FilterState, session_id: String) {
+    filter.clear();
+    filter
+        .facets
+        .entry("app_session_id".to_owned())
+        .or_default()
+        .include_only(session_id);
+}
+
 fn compact_identifier(value: &str, max_characters: usize) -> String {
     if value.chars().count() <= max_characters {
         return value.to_string();
@@ -6020,6 +6074,54 @@ mod tests {
         );
         assert!(is_groupable_event(&first));
         assert!(is_groupable_event(&information));
+    }
+
+    #[test]
+    fn repeat_summary_shows_the_occurrence_before_the_current_event() {
+        let mut store = EventStore::default();
+        store.extend([
+            session_event(
+                "session",
+                "request.failed",
+                "2026-08-22T20:32:52Z",
+                Level::Error,
+                None,
+                None,
+            ),
+            session_event(
+                "session",
+                "request.failed",
+                "2026-08-22T21:14:08Z",
+                Level::Error,
+                None,
+                None,
+            ),
+            session_event(
+                "session",
+                "request.failed",
+                "2026-08-22T22:02:29Z",
+                Level::Error,
+                None,
+                None,
+            ),
+        ]);
+
+        let summary = error_group_summary(
+            &store,
+            ErrorGroup {
+                count: 3,
+                first_index: 0,
+                previous_index: Some(1),
+                latest_index: 2,
+            },
+            TimestampDisplay::Utc,
+            "%d/%m/%Y %H:%M:%S",
+        );
+
+        assert_eq!(
+            summary.as_deref(),
+            Some("Repeated 3 times · first 22/08/2026 20:32:52 · last 22/08/2026 21:14:08")
+        );
     }
 
     #[test]
@@ -6577,6 +6679,131 @@ sources = ["logs"]
         assert_eq!(started.count_b, 1);
         assert_eq!(started.average_duration_a, Some(100.0));
         assert_eq!(started.average_duration_b, Some(240.0));
+    }
+
+    #[test]
+    fn session_comparison_detects_maximum_duration_only_changes() {
+        let mut left = SessionSummary::new(&session_event(
+            "run-a",
+            "sync.step",
+            "2026-08-22T10:00:00Z",
+            Level::Info,
+            Some(0.0),
+            None,
+        ));
+        left.observe(&session_event(
+            "run-a",
+            "sync.step",
+            "2026-08-22T10:00:01Z",
+            Level::Info,
+            Some(100.0),
+            None,
+        ));
+        let mut right = SessionSummary::new(&session_event(
+            "run-b",
+            "sync.step",
+            "2026-08-22T11:00:00Z",
+            Level::Info,
+            Some(50.0),
+            None,
+        ));
+        right.observe(&session_event(
+            "run-b",
+            "sync.step",
+            "2026-08-22T11:00:01Z",
+            Level::Info,
+            Some(50.0),
+            None,
+        ));
+
+        let rows = compare_sessions(&left, &right);
+        assert_eq!(rows[0].average_duration_a, rows[0].average_duration_b);
+        assert_ne!(rows[0].max_duration_a, rows[0].max_duration_b);
+        assert!(rows[0].differs());
+    }
+
+    #[test]
+    fn viewing_a_session_replaces_every_conflicting_filter() {
+        let mut filter = FilterState {
+            text: "failed provider=remote".to_owned(),
+            minimum_level: Some(Level::Error),
+            correlation: Some("request-other".to_owned()),
+            ..FilterState::default()
+        };
+        filter
+            .facets
+            .entry("provider".to_owned())
+            .or_default()
+            .include_only("remote");
+        filter
+            .facets
+            .entry("app_session_id".to_owned())
+            .or_default()
+            .toggle_exclude("run-a");
+
+        apply_session_filter(&mut filter, "run-a".to_owned());
+
+        assert!(filter.text.is_empty());
+        assert_eq!(filter.minimum_level, None);
+        assert_eq!(filter.correlation, None);
+        assert_eq!(filter.facets.len(), 1);
+        let session = &filter.facets["app_session_id"];
+        assert_eq!(session.included.iter().collect::<Vec<_>>(), vec!["run-a"]);
+        assert!(session.excluded.is_empty());
+    }
+
+    #[test]
+    fn relative_time_anchor_uses_the_complete_session_summary() {
+        let mut explorer = SessionExplorerState::default();
+        explorer.observe_many(&[
+            session_event(
+                "run-a",
+                "sync.started",
+                "2026-08-22T10:00:00Z",
+                Level::Info,
+                None,
+                None,
+            ),
+            session_event(
+                "run-a",
+                "sync.failed",
+                "2026-08-22T10:00:05Z",
+                Level::Error,
+                None,
+                None,
+            ),
+        ]);
+
+        let starts = session_start_times(&explorer.summaries);
+        assert_eq!(
+            starts["run-a"],
+            "2026-08-22T10:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn pin_lookup_finds_events_hidden_from_the_presented_table() {
+        let hidden = session_event(
+            "run-pin",
+            "sync.started",
+            "2026-08-22T10:00:00Z",
+            Level::Info,
+            None,
+            None,
+        );
+        let visible = session_event(
+            "run-pin",
+            "sync.failed",
+            "2026-08-22T10:00:01Z",
+            Level::Error,
+            None,
+            None,
+        );
+        let hidden_key = event_pin_key(&hidden);
+        let mut store = EventStore::default();
+        store.extend([hidden, visible]);
+
+        assert_eq!(event_index_by_key(&store, &hidden_key), Some(0));
     }
 
     #[test]
