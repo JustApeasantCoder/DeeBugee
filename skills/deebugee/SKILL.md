@@ -12,7 +12,7 @@ DeeBugee is a native Windows viewer for structured, local, append-only JSONL dia
 
 - **Investigate a problem with existing logs:** read [references/viewer-workflows.md](references/viewer-workflows.md). Inspect fresh events and use the viewer's structured workflow before proposing instrumentation or code changes.
 - **Add or improve application logging:** read [references/instrumentation.md](references/instrumentation.md). Inspect the application's existing logging path, process boundaries, lifecycle, and representative logs first; extend the central path instead of creating a parallel logger.
-- **Configure a repository for DeeBugee:** use project mode and the project-manifest guidance in [references/viewer-workflows.md](references/viewer-workflows.md). Keep the viewer installed once per developer rather than copying its executable into each repository.
+- **Configure a repository for DeeBugee:** use project mode and the project-manifest guidance in [references/viewer-workflows.md](references/viewer-workflows.md). Keep `.deebugee/` local and Git-ignored by default, and keep the viewer installed once per developer rather than copying its executable into each repository. Track a project manifest only when the user explicitly requests a shared manifest.
 - **Change the DeeBugee repository:** read [references/repository-work.md](references/repository-work.md) before changing the viewer, core, schema, adapters, documentation, versioning, or release flow.
 - **Support another runtime:** follow the event contract below and the custom-writer guidance in [references/instrumentation.md](references/instrumentation.md). Reuse v1 instead of inventing a competing format.
 

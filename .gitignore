@@ -9,6 +9,7 @@ dist/
 *.suo
 .idea/
 .vscode/
-.mallee/*.bak
+.deebugee/
+.mallee/
 BUILD.bat
 RELEASE.bat

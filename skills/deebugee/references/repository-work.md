@@ -16,7 +16,7 @@ Keep cross-surface changes coordinated:
 - Tail-follow changes must preserve the user's vertical intent. Retain a scroll request until the viewport reaches the actual latest edge and settles; horizontal scrolling or middle-button panning must not disable vertical following.
 - Bounded retention must not modify source logs, and older visible rows should remain stable while the user is inspecting history away from the latest edge.
 - Repeat grouping is a table-presentation feature. Keep filters, severity semantics, event details, and filtered export operating on the underlying events rather than the collapsed group rows.
-- Project mode keeps the committed `.deebugee/project.toml` definition separate from per-developer workspace state under Local AppData. Preserve relative and `%NAME%` source expansion, stable project identity, explicit `--logs` overrides, and the `--project`/`--workspace` conflict check together.
+- Project mode keeps `.deebugee/project.toml` separate from per-developer workspace state under Local AppData. Consuming repositories should ignore `.deebugee/` by default and track a manifest only when the user explicitly requests a shared definition. Preserve relative and `%NAME%` source expansion, stable project identity, explicit `--logs` overrides, and the `--project`/`--workspace` conflict check together.
 
 ## Development and versioning
 
@@ -47,4 +47,3 @@ Run the two .NET builds sequentially because shared outputs can be temporarily l
 For viewer behavior, supplement automated checks with a representative JSONL file such as `tests\fixtures\sample.jsonl` or `examples\showcase.jsonl`. Verify actual interaction when the change concerns dragging, scrolling, follow state, persistence, file rotation/replacement, or live tailing; compilation alone does not prove those behaviors.
 
 Before a requested commit or release, also inspect ignored/untracked files and credential-like content, run `git diff --check` (and staged checks when applicable), and make sure the versioned surfaces are coherent. Do not publish, tag, or push unless the user requested that external action.
-

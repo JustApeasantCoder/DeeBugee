@@ -1,6 +1,6 @@
 ---
 name: deebugee-project-install
-description: Install or update the portable DeeBugee viewer once for a Windows developer and configure a consuming repository with a committed .deebugee/project.toml manifest. Use for DeeBugee onboarding or project discovery; not for developing DeeBugee itself or changing application logging instrumentation.
+description: Install or update the portable DeeBugee viewer once for a Windows developer and configure a consuming repository with a local, Git-ignored .deebugee/project.toml manifest. Use for DeeBugee onboarding or project discovery; not for developing DeeBugee itself or changing application logging instrumentation.
 license: MIT
 ---
 
@@ -8,15 +8,24 @@ license: MIT
 
 Keep viewer installation and project configuration separate. A developer keeps
 one portable executable outside application repositories. Each application may
-commit one project manifest, while filters, bookmarks, and layout stay private
-under Local AppData.
+keep one local project manifest, while filters, bookmarks, and layout stay
+private under Local AppData. Ignore `.deebugee/` in Git by default. Track the
+manifest only when the user explicitly requests a shared project definition.
 
 ## Gather the real inputs
 
 Before configuring a project, identify the exact repository root and real JSONL
 files or directories from its logging code or saved configuration. Do not guess
 a generic log path. Inspect an existing `.deebugee/project.toml` before changing
-it.
+it. In a Git repository, inspect the applicable ignore rules and tracked state.
+
+Before creating or updating the manifest, ensure the repository's applicable
+Git ignore file contains `.deebugee/`; prefer the root `.gitignore` when no more
+specific convention applies, and do not add a duplicate rule. An ignore rule
+does not untrack a manifest already in Git. Do not remove it from the index or
+rewrite an intentional sharing policy unless the user explicitly asks; report
+the tracked state instead. If the user explicitly requests a shared manifest,
+that instruction overrides the default ignore policy.
 
 ## Install the viewer
 
@@ -96,6 +105,8 @@ with `--project`.
 
 Verify that the executable remains outside the application repository, the
 manifest contains the intended ID/name/sources, environment variables resolve,
-and `dee-bugee.exe --project <root>` loads the manifest. Personal project state
-belongs under `%LOCALAPPDATA%\DeeBugee\projects`, not in Git. Launch a window only
-when it is within the user's request; otherwise report the command.
+and `dee-bugee.exe --project <root>` loads the manifest. Unless the user
+explicitly requested a shared manifest, verify that Git ignores `.deebugee/`
+and that the manifest is not tracked. Personal project state belongs under
+`%LOCALAPPDATA%\DeeBugee\projects`, not in Git. Launch a window only when it is
+within the user's request; otherwise report the command.

@@ -5,12 +5,12 @@ Use this reference when configuring DeeBugee or diagnosing an application from e
 ## Choose the right launch surface
 
 - **Direct logs:** open one or more `.jsonl` files, drag them into DeeBugee, open a folder containing JSONL files, or run `dee-bugee.exe <path>`. Use this for a quick one-off investigation. Adding sources merges them into the current view; **New** clears the loaded set.
-- **Project mode:** run `dee-bugee.exe --project <repository>` or `dee-bugee.exe <repository>` when `.deebugee/project.toml` exists. Use this for a repository's normal shared log-source definition. The committed manifest contains a stable ID, display name, and file/directory sources; each developer's filters, bookmarks, layout, and workspace state remain private under Local AppData.
+- **Project mode:** run `dee-bugee.exe --project <repository>` or `dee-bugee.exe <repository>` when `.deebugee/project.toml` exists. Use this for a repository's normal log-source definition. Keep `.deebugee/` in the repository's applicable Git ignore file by default so the manifest remains developer-local. Track the manifest only when the user explicitly requests a shared definition. Each developer's filters, bookmarks, layout, and workspace state remain private under Local AppData.
 - **Standalone workspace:** use `--workspace <path>` or the Workspace menu when the exact sources, filters, bookmarks, column order, colors, timestamps, repeat grouping, live-follow settings, and memory limit should be reopened together. Do not combine `--workspace` and `--project`.
 
 In project mode, `--logs <path>` may be repeated to override manifest sources for that launch. Relative manifest sources resolve from the repository root and Windows `%NAME%` variables are supported. Prefer `%LOCALAPPDATA%` or relative paths over machine-specific absolute paths. A source can name a file that has not been created yet. Folder sources cover JSONL files directly inside that folder; do not assume recursive discovery.
 
-Install or update one shared portable viewer per developer. Do not commit the executable, personal workspace, or launcher boilerplate merely to make a project discoverable.
+Install or update one shared portable viewer per developer. Do not commit the executable, `.deebugee/` directory, personal workspace, or launcher boilerplate merely to make a project discoverable unless the user explicitly asks to share the project manifest.
 
 ## Run a structured investigation
 
@@ -39,4 +39,3 @@ Report the evidence trail, not merely a matching message: include the app/correl
 ## Turn gaps into targeted instrumentation
 
 Only add logging after the existing trail cannot distinguish the remaining hypotheses. Place the new event at a real decision or process boundary and include the identifier and state that make the branches separable. Avoid adding broad debug noise, duplicating a central logger, or logging the same payload at every layer.
-
