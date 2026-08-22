@@ -127,7 +127,7 @@ $previousProgressPreference = $ProgressPreference
 try {
     $ProgressPreference = "SilentlyContinue"
     foreach ($asset in $assets) {
-        $stagedDownload = Join-Path $resolvedInstallDirectory ".${($asset.Name)}.download.$([Guid]::NewGuid().ToString('N'))"
+        $stagedDownload = Join-Path $resolvedInstallDirectory ".$($asset.Name).download.$([Guid]::NewGuid().ToString('N'))"
         $stagedDownloads += $stagedDownload
         Write-Host "Downloading $($asset.Name) $($release.tag_name)..."
         Invoke-WebRequest -Uri $asset.DownloadUrl -Headers $apiHeaders -OutFile $stagedDownload -UseBasicParsing
@@ -142,7 +142,7 @@ try {
         $asset = $assets[$index]
         $destination = Join-Path $resolvedInstallDirectory $asset.Name
         $stagedDownload = $stagedDownloads[$index]
-        $backup = Join-Path $resolvedInstallDirectory ".${($asset.Name)}.backup.$([Guid]::NewGuid().ToString('N'))"
+        $backup = Join-Path $resolvedInstallDirectory ".$($asset.Name).backup.$([Guid]::NewGuid().ToString('N'))"
         if (Test-Path -LiteralPath $destination -PathType Leaf) {
             [IO.File]::Replace($stagedDownload, $destination, $backup, $true)
             $backups += $backup
