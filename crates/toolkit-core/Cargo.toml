@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chrono.workspace = true
 dee-bugee-schema = { path = "../toolkit-schema" }
 roaring.workspace = true
 serde.workspace = true

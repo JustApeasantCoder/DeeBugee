@@ -173,19 +173,45 @@ Facet controls provide fast structured filtering. Feature tags are derived consi
 
 Save frequently used searches and facet combinations as bookmarks from the bar above the table. Saved views belong to the selected JSONL file or source set, so opening another log starts with its own views and reopening a log restores its views. Left-click a bookmark to restore it, Ctrl+Alt+left-click to replace it with the current filters, middle-click to rename it, and right-click to remove it.
 
+Structured expressions can be mixed with ordinary fuzzy terms in the same search. DeeBugee recognizes them as removable query chips and applies all terms with AND semantics:
+
+```text
+sync provider=remote duration_ms>1000
+status != completed fields.retry_count >= 3
+timestamp:last-5m
+timestamp >= 2026-08-22T10:00:00Z
+event="sync.completed"
+```
+
+Use `=`, `!=`, `>`, `>=`, `<`, or `<=`. String comparisons are case-insensitive exact matches; quote values containing spaces. Numeric comparisons work with `duration_ms`, `schema_version`, and numeric `fields.*` values. Timestamps accept Unix milliseconds, RFC 3339, or relative `last-30s`, `last-5m`, `last-2h`, and `last-1d` values. Malformed structured expressions are shown beneath the search and intentionally match no records until corrected.
+
+### Session Explorer and run comparison
+
+Open **Sessions** from the toolbar to see loaded application runs grouped by `app_session_id`. Each run summarizes its time range, event count, warnings, errors, providers, correlations, and latest reported status. Use **View** to filter the main table to the complete run, including events whose more-specific correlation IDs differ.
+
+Mark two runs as **A** and **B** to compare their event coverage and outcomes. DeeBugee places missing or changed event types first and shows count, error, average-duration, maximum-duration, and final-status differences without changing the underlying logs.
+
 ### Table and live-follow controls
 
 - Drag column headers to reorder them and edges to resize them.
+- Use the **Relative** column to read each event as elapsed time from the start of its application run.
 - Use compact or wrapped messages, then select a row to inspect the full structured event.
+- Press Up/Down to move between rows, F8/Shift+F8 for the next/previous error, Ctrl+Down/Ctrl+Up for the next/previous pin, P to pin, and N to edit a pinned event's note.
 - Pause and resume live following, and place the newest record at the top or bottom.
 - Color related events by source, feature tag, subsystem, target, event, provider, or correlation.
 - Set **Keep latest** to maintain a configurable bounded window without modifying source logs. Older rows remain stable while you inspect history.
 
 Manual vertical scrolling pauses automatic following until you return to the latest edge. Horizontal scrolling does not interrupt vertical following. Layout, panel sizes, bookmarks, message wrapping, colors, and tail preferences are restored between launches.
 
+Search above the facet list narrows long value lists. **Settings → Facet Sections** controls which sections are shown and their order. The source-health menu reports loading/tailing state, file rotation or truncation, missing sources, reader failures, and JSONL parse errors. Event Details includes one-click correlation and `fields.*` path copying.
+
+### Pins and investigation notes
+
+Select an event and choose **Pin** (or press P) to keep it in the investigation strip. Pins and their notes belong to the current source set and persist with saved workspaces. The strip navigates between loaded pinned events and shows the elapsed span from the first pin to the last. Choose **Workspace → Export Investigation…** to write a portable JSON report containing the active sources, filter, pinned event snapshots, and notes.
+
 ### Workspaces and export
 
-A saved TOML workspace records the open sources, filters, bookmarks, column order, color grouping, latest-record position, and log limit. Use workspaces to return to the same diagnostic setup later, keep projects isolated, or share a repeatable view with another developer.
+A saved TOML workspace records the open sources, filters, bookmarks, pins and notes, facet layout, column order, color grouping, latest-record position, and log limit. Use workspaces to return to the same diagnostic setup later, keep projects isolated, or share a repeatable view with another developer.
 
 Filtered records can be exported to a new JSONL file without modifying source logs.
 

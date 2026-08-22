@@ -4,10 +4,15 @@ use std::{
     sync::Arc,
 };
 
+use chrono::Utc;
 use dee_bugee_schema::{Level, LogEvent, scalar_text};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+mod query;
+
+pub use query::{ParsedPredicate, ParsedQuery, QueryError, parse_structured_query};
 
 pub const DEFAULT_MAX_EVENTS: usize = 250_000;
 
@@ -216,15 +221,29 @@ impl EventStore {
 
     pub fn query(&self, filter: &FilterState) -> Vec<usize> {
         let text_matches = self.search_matches(&filter.text);
-        self.query_bitmap(filter, None, text_matches.as_deref())
-            .iter()
-            .map(|index| index as usize)
-            .collect()
+        let parsed = parse_structured_query(&filter.text, Utc::now());
+        let structured_matches = self.structured_matches(&parsed);
+        self.query_bitmap(
+            filter,
+            None,
+            text_matches.as_deref(),
+            structured_matches.as_ref(),
+        )
+        .iter()
+        .map(|index| index as usize)
+        .collect()
     }
 
     pub fn facet_counts(&self, facet: &str, filter: &FilterState) -> Vec<(String, u64)> {
         let text_matches = self.search_matches(&filter.text);
-        self.facet_counts_with_matches(facet, filter, text_matches.as_deref())
+        let parsed = parse_structured_query(&filter.text, Utc::now());
+        let structured_matches = self.structured_matches(&parsed);
+        self.facet_counts_with_matches(
+            facet,
+            filter,
+            text_matches.as_deref(),
+            structured_matches.as_ref(),
+        )
     }
 
     pub fn query_with_facets(
@@ -233,8 +252,10 @@ impl EventStore {
         facets: &[String],
         text_matches: Option<&[usize]>,
     ) -> FilterResults {
+        let parsed = parse_structured_query(&filter.text, Utc::now());
+        let structured_matches = self.structured_matches(&parsed);
         let rows = self
-            .query_bitmap(filter, None, text_matches)
+            .query_bitmap(filter, None, text_matches, structured_matches.as_ref())
             .iter()
             .map(|index| index as usize)
             .collect();
@@ -243,7 +264,12 @@ impl EventStore {
             .map(|facet| {
                 (
                     facet.clone(),
-                    self.facet_counts_with_matches(facet, filter, text_matches),
+                    self.facet_counts_with_matches(
+                        facet,
+                        filter,
+                        text_matches,
+                        structured_matches.as_ref(),
+                    ),
                 )
             })
             .collect();
@@ -259,7 +285,8 @@ impl EventStore {
     }
 
     fn search_matches(&self, query: &str) -> Option<Vec<usize>> {
-        let terms = search_terms(query);
+        let parsed = parse_structured_query(query, Utc::now());
+        let terms = search_terms(&parsed.text);
         (!terms.is_empty()).then(|| {
             self.search_documents
                 .iter()
@@ -276,6 +303,7 @@ impl EventStore {
         facet: &str,
         filter: &FilterState,
         text_matches: Option<&[usize]>,
+        structured_matches: Option<&RoaringBitmap>,
     ) -> Vec<(String, u64)> {
         let Some(values) = self.indexes.get(facet) else {
             return Vec::new();
@@ -287,8 +315,8 @@ impl EventStore {
                 .facets
                 .iter()
                 .any(|(name, selection)| name != facet && !selection.is_empty());
-        let candidates =
-            has_other_filters.then(|| self.query_bitmap(filter, Some(facet), text_matches));
+        let candidates = has_other_filters
+            .then(|| self.query_bitmap(filter, Some(facet), text_matches, structured_matches));
 
         let mut counts: Vec<_> = values
             .iter()
@@ -309,6 +337,7 @@ impl EventStore {
         filter: &FilterState,
         ignored_facet: Option<&str>,
         text_matches: Option<&[usize]>,
+        structured_matches: Option<&RoaringBitmap>,
     ) -> RoaringBitmap {
         let mut result: RoaringBitmap = text_matches.map_or_else(
             || (0..self.events.len() as u32).collect(),
@@ -321,6 +350,10 @@ impl EventStore {
                     .collect()
             },
         );
+
+        if let Some(structured_matches) = structured_matches {
+            result &= structured_matches;
+        }
 
         for (facet, selection) in &filter.facets {
             if ignored_facet == Some(facet.as_str()) || selection.is_empty() {
@@ -376,6 +409,28 @@ impl EventStore {
         }
 
         result
+    }
+
+    fn structured_matches(&self, parsed: &ParsedQuery) -> Option<RoaringBitmap> {
+        if parsed.predicates.is_empty() && parsed.errors.is_empty() {
+            return None;
+        }
+        if !parsed.errors.is_empty() {
+            return Some(RoaringBitmap::new());
+        }
+        Some(
+            self.events
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| {
+                    parsed
+                        .predicates
+                        .iter()
+                        .all(|predicate| predicate.matches(event))
+                        .then_some(index as u32)
+                })
+                .collect(),
+        )
     }
 
     fn rebuild_indexes(&mut self) {
@@ -445,9 +500,10 @@ pub struct SearchSnapshot {
 
 impl SearchSnapshot {
     pub fn search(&self, query: &str, mut cancelled: impl FnMut() -> bool) -> Option<Vec<usize>> {
-        let terms = search_terms(query);
+        let parsed = parse_structured_query(query, Utc::now());
+        let terms = search_terms(&parsed.text);
         if terms.is_empty() {
-            return Some(Vec::new());
+            return Some((self.start_index..self.start_index + self.documents.len()).collect());
         }
         let mut matches = Vec::new();
         for (offset, document) in self.documents.iter().enumerate() {
@@ -801,6 +857,53 @@ mod tests {
         assert_eq!(store.query(&filter), vec![0]);
 
         filter.text = "segment remote".to_string();
+        assert!(store.query(&filter).is_empty());
+    }
+
+    #[test]
+    fn structured_queries_filter_exact_numeric_timestamp_and_field_values() {
+        let mut matching = event(Level::Error, "backend", "sync", "sync failed");
+        matching.provider = Some("remote".to_string());
+        matching.duration_ms = Some(1_250.0);
+        matching.status = Some(Value::String("failed".to_string()));
+        matching.fields.insert("retry_count".into(), 3.into());
+        matching.timestamp = "2026-08-22T10:00:00Z".parse().unwrap();
+
+        let mut fast = event(Level::Info, "backend", "sync", "sync completed");
+        fast.provider = Some("remote".to_string());
+        fast.duration_ms = Some(80.0);
+        fast.status = Some(Value::String("completed".to_string()));
+        fast.fields.insert("retry_count".into(), 0.into());
+        fast.timestamp = "2026-08-22T10:01:00Z".parse().unwrap();
+
+        let mut missing_status = event(Level::Warn, "backend", "sync", "sync pending");
+        missing_status.duration_ms = Some(2_000.0);
+        missing_status.fields.insert("retry_count".into(), 4.into());
+        missing_status.timestamp = "2026-08-22T10:02:00Z".parse().unwrap();
+
+        let mut store = EventStore::new(100);
+        store.extend([matching, fast, missing_status]);
+        let filter = FilterState {
+            text: "sync provider=remote duration_ms>=1000 fields.retry_count >= 2 status!=completed timestamp>=2026-08-22T09:59:00Z".to_string(),
+            ..FilterState::default()
+        };
+
+        assert_eq!(store.query(&filter), vec![0]);
+        assert_eq!(
+            store.facet_counts("source", &filter),
+            vec![("backend".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn invalid_structured_queries_fail_closed() {
+        let mut store = EventStore::new(10);
+        store.push(event(Level::Info, "app", "sync", "sync completed"));
+        let filter = FilterState {
+            text: "duration_ms>slow".to_string(),
+            ..FilterState::default()
+        };
+
         assert!(store.query(&filter).is_empty());
     }
 

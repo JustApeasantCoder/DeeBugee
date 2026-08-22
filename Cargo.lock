@@ -807,6 +807,7 @@ dependencies = [
 name = "dee-bugee-core"
 version = "1.0.33"
 dependencies = [
+ "chrono",
  "dee-bugee-schema",
  "roaring",
  "serde",

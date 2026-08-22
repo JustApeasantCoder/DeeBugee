@@ -40,6 +40,7 @@ pub enum ReaderMessage {
         error: String,
     },
     SourceOpened(PathBuf),
+    SourceReplaced(PathBuf),
     SourceError {
         path: PathBuf,
         error: String,
@@ -165,6 +166,7 @@ impl FileCursor {
             .file_identity
             .is_some_and(|previous| Some(previous) != file_identity);
         if replaced || metadata.len() < self.offset {
+            let _ = messages.send(ReaderMessage::SourceReplaced(path.to_path_buf()));
             self.offset = 0;
             self.line = 0;
             self.partial.clear();

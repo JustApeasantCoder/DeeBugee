@@ -1,7 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::{BufWriter, Write},
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -11,11 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use dee_bugee_core::{
-    DEFAULT_MAX_EVENTS, EventStore, FacetSelection, FilterState, PRIMARY_FACETS, SearchSnapshot,
-    status_text,
+    DEFAULT_MAX_EVENTS, EventStore, FacetSelection, FilterState, SearchSnapshot,
+    parse_structured_query, status_text,
 };
 use dee_bugee_schema::{Level, LogEvent};
 use eframe::egui::{
@@ -837,6 +838,7 @@ fn load_windows_font(candidates: &[&str]) -> Option<Vec<u8>> {
 #[serde(rename_all = "snake_case")]
 enum TableColumn {
     Timestamp,
+    RelativeTime,
     Level,
     Source,
     Tag,
@@ -874,6 +876,13 @@ impl TimestampDisplay {
                 .format(format)
                 .to_string(),
             Self::Utc => event.timestamp.format(format).to_string(),
+        }
+    }
+
+    fn format_timestamp(self, timestamp: DateTime<Utc>, format: &str) -> String {
+        match self {
+            Self::Local => timestamp.with_timezone(&Local).format(format).to_string(),
+            Self::Utc => timestamp.format(format).to_string(),
         }
     }
 }
@@ -977,9 +986,289 @@ struct ErrorGroup {
     latest_index: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SessionEventSummary {
+    count: usize,
+    warning_count: usize,
+    error_count: usize,
+    duration_total_ms: f64,
+    duration_count: usize,
+    max_duration_ms: Option<f64>,
+    last_status: Option<(DateTime<Utc>, String)>,
+}
+
+impl SessionEventSummary {
+    fn observe(&mut self, event: &LogEvent) {
+        self.count += 1;
+        match event.level {
+            Level::Warn => self.warning_count += 1,
+            Level::Error | Level::Fatal => self.error_count += 1,
+            Level::Trace | Level::Debug | Level::Info => {}
+        }
+        if let Some(duration_ms) = event.duration_ms {
+            self.duration_total_ms += duration_ms;
+            self.duration_count += 1;
+            self.max_duration_ms = Some(
+                self.max_duration_ms
+                    .map_or(duration_ms, |current| current.max(duration_ms)),
+            );
+        }
+        let status = status_text(event.status.as_ref());
+        if status != "-"
+            && self
+                .last_status
+                .as_ref()
+                .is_none_or(|(timestamp, _)| event.timestamp >= *timestamp)
+        {
+            self.last_status = Some((event.timestamp, status));
+        }
+    }
+
+    fn average_duration_ms(&self) -> Option<f64> {
+        (self.duration_count > 0).then(|| self.duration_total_ms / self.duration_count as f64)
+    }
+
+    fn status(&self) -> Option<&str> {
+        self.last_status.as_ref().map(|(_, status)| status.as_str())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionSummary {
+    id: String,
+    first_timestamp: DateTime<Utc>,
+    last_timestamp: DateTime<Utc>,
+    event_count: usize,
+    warning_count: usize,
+    error_count: usize,
+    providers: BTreeSet<String>,
+    correlations: BTreeSet<String>,
+    events: BTreeMap<String, SessionEventSummary>,
+    last_status: Option<(DateTime<Utc>, String)>,
+}
+
+impl SessionSummary {
+    fn new(event: &LogEvent) -> Self {
+        let mut summary = Self {
+            id: event.app_session_id.clone(),
+            first_timestamp: event.timestamp,
+            last_timestamp: event.timestamp,
+            event_count: 0,
+            warning_count: 0,
+            error_count: 0,
+            providers: BTreeSet::new(),
+            correlations: BTreeSet::new(),
+            events: BTreeMap::new(),
+            last_status: None,
+        };
+        summary.observe(event);
+        summary
+    }
+
+    fn observe(&mut self, event: &LogEvent) {
+        self.first_timestamp = self.first_timestamp.min(event.timestamp);
+        self.last_timestamp = self.last_timestamp.max(event.timestamp);
+        self.event_count += 1;
+        match event.level {
+            Level::Warn => self.warning_count += 1,
+            Level::Error | Level::Fatal => self.error_count += 1,
+            Level::Trace | Level::Debug | Level::Info => {}
+        }
+        if let Some(provider) = event.provider.as_deref().filter(|value| !value.is_empty()) {
+            self.providers.insert(provider.to_string());
+        }
+        let correlation = event.correlation_id();
+        if correlation != event.app_session_id && !correlation.is_empty() {
+            self.correlations.insert(correlation.to_string());
+        }
+        let status = status_text(event.status.as_ref());
+        if status != "-"
+            && self
+                .last_status
+                .as_ref()
+                .is_none_or(|(timestamp, _)| event.timestamp >= *timestamp)
+        {
+            self.last_status = Some((event.timestamp, status));
+        }
+        self.events
+            .entry(event.event.clone())
+            .or_default()
+            .observe(event);
+    }
+
+    fn elapsed_ms(&self) -> i64 {
+        (self.last_timestamp - self.first_timestamp)
+            .num_milliseconds()
+            .max(0)
+    }
+
+    fn status(&self) -> Option<&str> {
+        self.last_status.as_ref().map(|(_, status)| status.as_str())
+    }
+}
+
+#[derive(Debug, Default)]
+struct SessionExplorerState {
+    open: bool,
+    summaries: BTreeMap<String, SessionSummary>,
+    compare_a: Option<String>,
+    compare_b: Option<String>,
+}
+
+impl SessionExplorerState {
+    fn observe_many(&mut self, events: &[LogEvent]) {
+        for event in events {
+            match self.summaries.get_mut(&event.app_session_id) {
+                Some(summary) => summary.observe(event),
+                None => {
+                    self.summaries
+                        .insert(event.app_session_id.clone(), SessionSummary::new(event));
+                }
+            }
+        }
+    }
+
+    fn rebuild(&mut self, store: &EventStore) {
+        self.summaries.clear();
+        for index in 0..store.len() {
+            if let Some(event) = store.get(index) {
+                match self.summaries.get_mut(&event.app_session_id) {
+                    Some(summary) => summary.observe(event),
+                    None => {
+                        self.summaries
+                            .insert(event.app_session_id.clone(), SessionSummary::new(event));
+                    }
+                }
+            }
+        }
+        self.retain_valid_selection();
+    }
+
+    fn reset(&mut self) {
+        self.summaries.clear();
+        self.compare_a = None;
+        self.compare_b = None;
+    }
+
+    fn retain_valid_selection(&mut self) {
+        if self
+            .compare_a
+            .as_ref()
+            .is_some_and(|id| !self.summaries.contains_key(id))
+        {
+            self.compare_a = None;
+        }
+        if self
+            .compare_b
+            .as_ref()
+            .is_some_and(|id| !self.summaries.contains_key(id))
+        {
+            self.compare_b = None;
+        }
+    }
+
+    fn sorted_summaries(&self) -> Vec<SessionSummary> {
+        let mut summaries: Vec<_> = self.summaries.values().cloned().collect();
+        summaries.sort_by(|left, right| {
+            right
+                .last_timestamp
+                .cmp(&left.last_timestamp)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        summaries
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SessionComparisonRow {
+    event: String,
+    count_a: usize,
+    count_b: usize,
+    warnings_a: usize,
+    warnings_b: usize,
+    errors_a: usize,
+    errors_b: usize,
+    average_duration_a: Option<f64>,
+    average_duration_b: Option<f64>,
+    max_duration_a: Option<f64>,
+    max_duration_b: Option<f64>,
+    status_a: Option<String>,
+    status_b: Option<String>,
+}
+
+impl SessionComparisonRow {
+    fn differs(&self) -> bool {
+        self.count_a != self.count_b
+            || self.warnings_a != self.warnings_b
+            || self.errors_a != self.errors_b
+            || self.status_a != self.status_b
+            || duration_changed(self.average_duration_a, self.average_duration_b)
+    }
+
+    fn significance(&self) -> (bool, usize, usize) {
+        (
+            self.count_a == 0 || self.count_b == 0,
+            self.errors_a.abs_diff(self.errors_b),
+            self.count_a.abs_diff(self.count_b),
+        )
+    }
+}
+
+fn duration_changed(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => (left - right).abs() >= 1.0,
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+fn compare_sessions(left: &SessionSummary, right: &SessionSummary) -> Vec<SessionComparisonRow> {
+    let event_names: BTreeSet<_> = left
+        .events
+        .keys()
+        .chain(right.events.keys())
+        .cloned()
+        .collect();
+    let mut rows: Vec<_> = event_names
+        .into_iter()
+        .map(|event| {
+            let left = left.events.get(&event);
+            let right = right.events.get(&event);
+            SessionComparisonRow {
+                event,
+                count_a: left.map_or(0, |summary| summary.count),
+                count_b: right.map_or(0, |summary| summary.count),
+                warnings_a: left.map_or(0, |summary| summary.warning_count),
+                warnings_b: right.map_or(0, |summary| summary.warning_count),
+                errors_a: left.map_or(0, |summary| summary.error_count),
+                errors_b: right.map_or(0, |summary| summary.error_count),
+                average_duration_a: left.and_then(SessionEventSummary::average_duration_ms),
+                average_duration_b: right.and_then(SessionEventSummary::average_duration_ms),
+                max_duration_a: left.and_then(|summary| summary.max_duration_ms),
+                max_duration_b: right.and_then(|summary| summary.max_duration_ms),
+                status_a: left
+                    .and_then(SessionEventSummary::status)
+                    .map(str::to_string),
+                status_b: right
+                    .and_then(SessionEventSummary::status)
+                    .map(str::to_string),
+            }
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        right
+            .differs()
+            .cmp(&left.differs())
+            .then_with(|| right.significance().cmp(&left.significance()))
+            .then_with(|| left.event.cmp(&right.event))
+    });
+    rows
+}
+
 impl TableColumn {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Timestamp,
+        Self::RelativeTime,
         Self::Level,
         Self::Source,
         Self::Tag,
@@ -995,6 +1284,7 @@ impl TableColumn {
     const fn title(self) -> &'static str {
         match self {
             Self::Timestamp => "Timestamp",
+            Self::RelativeTime => "Relative",
             Self::Level => "Level",
             Self::Source => "Source",
             Self::Tag => "Tag",
@@ -1011,6 +1301,7 @@ impl TableColumn {
     fn layout(self) -> Column {
         match self {
             Self::Timestamp => Column::initial(225.0),
+            Self::RelativeTime => Column::initial(92.0),
             Self::Level => Column::initial(76.0),
             Self::Source => Column::initial(90.0),
             Self::Tag => Column::initial(130.0),
@@ -1030,13 +1321,81 @@ fn default_column_order() -> Vec<TableColumn> {
 }
 
 fn normalize_column_order(columns: Vec<TableColumn>) -> Vec<TableColumn> {
+    let had_relative_time = columns.contains(&TableColumn::RelativeTime);
     let mut normalized = Vec::with_capacity(TableColumn::ALL.len());
     for column in columns.into_iter().chain(TableColumn::ALL) {
         if !normalized.contains(&column) {
             normalized.push(column);
         }
     }
+    if !had_relative_time {
+        normalized.retain(|column| *column != TableColumn::RelativeTime);
+        let position = normalized
+            .iter()
+            .position(|column| *column == TableColumn::Timestamp)
+            .map_or(0, |position| position + 1);
+        normalized.insert(position, TableColumn::RelativeTime);
+    }
     normalized
+}
+
+fn normalize_saved_column_order(
+    mut columns: Vec<TableColumn>,
+    relative_time_column: bool,
+) -> Vec<TableColumn> {
+    if !relative_time_column {
+        columns.retain(|column| *column != TableColumn::RelativeTime);
+    }
+    normalize_column_order(columns)
+}
+
+fn default_facet_order() -> Vec<String> {
+    DISPLAYED_FACETS
+        .iter()
+        .map(|facet| (*facet).to_owned())
+        .collect()
+}
+
+fn normalize_facet_order(mut facets: Vec<String>) -> Vec<String> {
+    for facet in DISPLAYED_FACETS {
+        if !facets.iter().any(|existing| existing == facet) {
+            facets.push(facet.to_owned());
+        }
+    }
+    let mut seen = BTreeSet::new();
+    facets.retain(|facet| seen.insert(facet.clone()));
+    facets
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PinnedEvent {
+    key: String,
+    #[serde(default)]
+    note: String,
+    event_json: String,
+}
+
+impl PinnedEvent {
+    fn event(&self) -> Option<LogEvent> {
+        serde_json::from_str(&self.event_json).ok()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceHealthState {
+    Loading,
+    Tailing,
+    Rotated,
+    Missing,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct SourceHealth {
+    state: SourceHealthState,
+    parse_errors: u64,
+    rotations: u64,
+    detail: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1048,6 +1407,8 @@ struct ViewerPreferences {
     #[serde(default)]
     filter: FilterState,
     column_order: Vec<TableColumn>,
+    #[serde(default)]
+    relative_time_column: bool,
     wrapped_messages: bool,
     semantic_highlighting: bool,
     stick_to_bottom: bool,
@@ -1055,6 +1416,14 @@ struct ViewerPreferences {
     bookmarks: Vec<FilterBookmark>,
     #[serde(default)]
     bookmarks_by_source: BTreeMap<String, Vec<FilterBookmark>>,
+    #[serde(default)]
+    pins: Vec<PinnedEvent>,
+    #[serde(default)]
+    pins_by_source: BTreeMap<String, Vec<PinnedEvent>>,
+    #[serde(default = "default_facet_order")]
+    facet_order: Vec<String>,
+    #[serde(default)]
+    hidden_facets: BTreeSet<String>,
     latest_at: LatestAt,
     max_events: usize,
     timestamp_display: TimestampDisplay,
@@ -1071,12 +1440,17 @@ impl Default for ViewerPreferences {
             sources: Vec::new(),
             filter: FilterState::default(),
             column_order: default_column_order(),
+            relative_time_column: true,
             wrapped_messages: true,
             semantic_highlighting: false,
             stick_to_bottom: true,
             color_by: ColorBy::Off,
             bookmarks: Vec::new(),
             bookmarks_by_source: BTreeMap::new(),
+            pins: Vec::new(),
+            pins_by_source: BTreeMap::new(),
+            facet_order: default_facet_order(),
+            hidden_facets: BTreeSet::new(),
             latest_at: LatestAt::Bottom,
             max_events: DEFAULT_MAX_EVENTS,
             timestamp_display: TimestampDisplay::default(),
@@ -1105,9 +1479,17 @@ struct WorkspaceConfig {
     #[serde(default)]
     bookmarks: Vec<FilterBookmark>,
     #[serde(default)]
+    pins: Vec<PinnedEvent>,
+    #[serde(default = "default_facet_order")]
+    facet_order: Vec<String>,
+    #[serde(default)]
+    hidden_facets: BTreeSet<String>,
+    #[serde(default)]
     latest_at: LatestAt,
     #[serde(default = "default_column_order")]
     column_order: Vec<TableColumn>,
+    #[serde(default)]
+    relative_time_column: bool,
     #[serde(default = "default_max_events")]
     max_events: usize,
     #[serde(default)]
@@ -1129,8 +1511,12 @@ impl WorkspaceConfig {
             stick_to_bottom: true,
             color_by: ColorBy::Off,
             bookmarks: Vec::new(),
+            pins: Vec::new(),
+            facet_order: default_facet_order(),
+            hidden_facets: BTreeSet::new(),
             latest_at: LatestAt::Bottom,
             column_order: default_column_order(),
+            relative_time_column: true,
             max_events: DEFAULT_MAX_EVENTS,
             timestamp_display: TimestampDisplay::default(),
             timestamp_format: default_timestamp_format(),
@@ -1269,12 +1655,22 @@ pub struct ViewerApp {
     bookmarks_by_source: BTreeMap<String, Vec<FilterBookmark>>,
     bookmark_scope: Option<String>,
     bookmark_rename: Option<BookmarkRename>,
+    pins: Vec<PinnedEvent>,
+    pins_by_source: BTreeMap<String, Vec<PinnedEvent>>,
+    pin_note_edit: Option<(String, String)>,
+    facet_search: String,
+    facet_sections_expanded: bool,
+    facet_sections_request: Option<bool>,
+    facet_order: Vec<String>,
+    hidden_facets: BTreeSet<String>,
+    source_health: BTreeMap<PathBuf, SourceHealth>,
     latest_at: LatestAt,
     column_order: Vec<TableColumn>,
     middle_pan_active: bool,
     tail_was_at_bottom: bool,
     scroll_to_bottom_requested: bool,
     scroll_settle_frames: u8,
+    scroll_to_selected_requested: bool,
     last_discarded_events: u64,
     search_worker: SearchWorker,
     search_generation: u64,
@@ -1295,6 +1691,7 @@ pub struct ViewerApp {
     update_receiver: Option<std::sync::mpsc::Receiver<CheckResult>>,
     update_state: UpdateState,
     update_check_was_requested: bool,
+    session_explorer: SessionExplorerState,
 }
 
 impl ViewerApp {
@@ -1306,7 +1703,10 @@ impl ViewerApp {
             .and_then(|storage| eframe::get_value::<ViewerPreferences>(storage, PREFERENCES_KEY))
             .filter(|preferences| preferences.version == 1)
             .unwrap_or_default();
-        preferences.column_order = normalize_column_order(preferences.column_order);
+        preferences.column_order = normalize_saved_column_order(
+            preferences.column_order,
+            preferences.relative_time_column,
+        );
         preferences.max_events = preferences.max_events.clamp(1, MAX_CONFIGURABLE_EVENTS);
         preferences.ui_scale = preferences.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
         creation_context
@@ -1376,6 +1776,7 @@ impl ViewerApp {
                 .map(|workspace| workspace.sources.clone())
                 .unwrap_or_default()
         };
+        let paths_to_open = normalize_source_paths(paths_to_open);
         let filter = workspace
             .as_ref()
             .map(|workspace| workspace.filter.clone())
@@ -1400,12 +1801,14 @@ impl ViewerApp {
             .as_ref()
             .map(|workspace| workspace.latest_at)
             .unwrap_or(preferences.latest_at);
-        let column_order = normalize_column_order(
-            workspace
-                .as_ref()
-                .map(|workspace| workspace.column_order.clone())
-                .unwrap_or(preferences.column_order),
-        );
+        let column_order = workspace
+            .as_ref()
+            .map_or(preferences.column_order, |workspace| {
+                normalize_saved_column_order(
+                    workspace.column_order.clone(),
+                    workspace.relative_time_column,
+                )
+            });
         let max_events = workspace
             .as_ref()
             .map(|workspace| workspace.max_events)
@@ -1439,6 +1842,31 @@ impl ViewerApp {
             },
             |workspace| workspace.bookmarks.clone(),
         );
+        let mut pins_by_source = preferences.pins_by_source;
+        let pins = workspace.as_ref().map_or_else(
+            || {
+                bookmark_scope
+                    .as_ref()
+                    .map(|scope| {
+                        pins_by_source
+                            .entry(scope.clone())
+                            .or_insert_with(|| preferences.pins.clone())
+                            .clone()
+                    })
+                    .unwrap_or_default()
+            },
+            |workspace| workspace.pins.clone(),
+        );
+        let facet_order = normalize_facet_order(
+            workspace
+                .as_ref()
+                .map(|workspace| workspace.facet_order.clone())
+                .unwrap_or(preferences.facet_order),
+        );
+        let hidden_facets = workspace
+            .as_ref()
+            .map(|workspace| workspace.hidden_facets.clone())
+            .unwrap_or(preferences.hidden_facets);
         let reader = spawn_reader(paths_to_open.clone());
         let search_worker = SearchWorker::spawn(creation_context.egui_ctx.clone());
         let mut app = Self {
@@ -1469,12 +1897,22 @@ impl ViewerApp {
             bookmarks_by_source,
             bookmark_scope,
             bookmark_rename: None,
+            pins,
+            pins_by_source,
+            pin_note_edit: None,
+            facet_search: String::new(),
+            facet_sections_expanded: false,
+            facet_sections_request: None,
+            facet_order,
+            hidden_facets,
+            source_health: BTreeMap::new(),
             latest_at,
             column_order,
             middle_pan_active: false,
             tail_was_at_bottom: true,
             scroll_to_bottom_requested: true,
             scroll_settle_frames: LATEST_SETTLE_FRAMES,
+            scroll_to_selected_requested: false,
             last_discarded_events: 0,
             search_worker,
             search_generation: 0,
@@ -1495,6 +1933,7 @@ impl ViewerApp {
             update_receiver: Some(update::check_for_update_async()),
             update_state: UpdateState::Checking,
             update_check_was_requested: false,
+            session_explorer: SessionExplorerState::default(),
         };
         app.refresh_filters();
         if !app.filter.text.trim().is_empty() {
@@ -1516,6 +1955,7 @@ impl ViewerApp {
         loop {
             match self.reader.messages.try_recv() {
                 Ok(ReaderMessage::Batch(events)) => {
+                    self.session_explorer.observe_many(&events);
                     self.store.extend(events);
                     received_events = true;
                 }
@@ -1523,6 +1963,16 @@ impl ViewerApp {
                     path,
                     file_size_bytes,
                 }) => {
+                    let health = self
+                        .source_health
+                        .entry(path.clone())
+                        .or_insert(SourceHealth {
+                            state: SourceHealthState::Loading,
+                            parse_errors: 0,
+                            rotations: 0,
+                            detail: None,
+                        });
+                    health.state = SourceHealthState::Loading;
                     self.source_load_started_at
                         .insert(path.clone(), Instant::now());
                     tracing::info!(
@@ -1542,6 +1992,17 @@ impl ViewerApp {
                     invalid_count,
                     duration,
                 }) => {
+                    let health = self
+                        .source_health
+                        .entry(path.clone())
+                        .or_insert(SourceHealth {
+                            state: SourceHealthState::Tailing,
+                            parse_errors: 0,
+                            rotations: 0,
+                            detail: None,
+                        });
+                    health.state = SourceHealthState::Tailing;
+                    health.parse_errors = health.parse_errors.max(invalid_count);
                     let end_to_end_duration = self
                         .source_load_started_at
                         .remove(&path)
@@ -1563,15 +2024,58 @@ impl ViewerApp {
                 }
                 Ok(ReaderMessage::InvalidRecord { path, line, error }) => {
                     self.invalid_records += 1;
+                    let health = self
+                        .source_health
+                        .entry(path.clone())
+                        .or_insert(SourceHealth {
+                            state: SourceHealthState::Tailing,
+                            parse_errors: 0,
+                            rotations: 0,
+                            detail: None,
+                        });
+                    health.parse_errors += 1;
+                    health.detail = Some(format!("line {line}: {error}"));
                     self.last_error = Some(format!("{}:{line}: {error}", path.display()));
                 }
                 Ok(ReaderMessage::SourceOpened(path)) => {
                     if !self.sources.contains(&path) {
-                        self.sources.push(path);
+                        self.sources.push(path.clone());
                         self.sources.sort();
                     }
+                    self.source_health.entry(path).or_insert(SourceHealth {
+                        state: SourceHealthState::Tailing,
+                        parse_errors: 0,
+                        rotations: 0,
+                        detail: None,
+                    });
+                }
+                Ok(ReaderMessage::SourceReplaced(path)) => {
+                    let health = self.source_health.entry(path).or_insert(SourceHealth {
+                        state: SourceHealthState::Rotated,
+                        parse_errors: 0,
+                        rotations: 0,
+                        detail: None,
+                    });
+                    health.state = SourceHealthState::Rotated;
+                    health.rotations += 1;
+                    health.detail =
+                        Some("File was replaced or truncated; tail restarted".to_owned());
                 }
                 Ok(ReaderMessage::SourceError { path, error }) => {
+                    let state = if path.exists() {
+                        SourceHealthState::Error
+                    } else {
+                        SourceHealthState::Missing
+                    };
+                    self.source_health.insert(
+                        path.clone(),
+                        SourceHealth {
+                            state,
+                            parse_errors: 0,
+                            rotations: 0,
+                            detail: Some(error.clone()),
+                        },
+                    );
                     self.last_error = Some(format!("{}: {error}", path.display()));
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1584,6 +2088,7 @@ impl ViewerApp {
 
         if self.store.discarded_events() != self.last_discarded_events {
             self.last_discarded_events = self.store.discarded_events();
+            self.session_explorer.rebuild(&self.store);
             self.selected_row = None;
             received_events = true;
             if !self.filter.text.trim().is_empty() && !self.paused {
@@ -1711,18 +2216,26 @@ impl ViewerApp {
         }
     }
 
+    fn query_text_changed(&mut self) {
+        self.schedule_text_search(SEARCH_DEBOUNCE);
+        self.filters_dirty = true;
+        self.tail_was_at_bottom = true;
+        self.request_scroll_to_latest();
+    }
+
     fn displayed_facets(&self) -> Vec<String> {
-        let mut facets: Vec<String> = DISPLAYED_FACETS
-            .iter()
-            .map(|facet| facet.to_string())
+        let discovered: Vec<String> = self
+            .store
+            .facet_names()
+            .filter(|facet| facet.starts_with("fields."))
+            .take(20)
+            .map(str::to_string)
             .collect();
-        facets.extend(
-            self.store
-                .facet_names()
-                .filter(|facet| facet.starts_with("fields."))
-                .take(20)
-                .map(str::to_string),
-        );
+        let mut facets = self.facet_order.clone();
+        facets.extend(discovered);
+        facets.retain(|facet| !self.hidden_facets.contains(facet));
+        let mut seen = BTreeSet::new();
+        facets.retain(|facet| seen.insert(facet.clone()));
         facets
     }
 
@@ -1934,6 +2447,7 @@ impl ViewerApp {
     }
 
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
+        let paths = normalize_source_paths(paths);
         if paths.is_empty() {
             return;
         }
@@ -1958,11 +2472,18 @@ impl ViewerApp {
 
         if let Some(scope) = self.bookmark_scope.take() {
             self.bookmarks_by_source
-                .insert(scope, std::mem::take(&mut self.bookmarks));
+                .insert(scope.clone(), std::mem::take(&mut self.bookmarks));
+            self.pins_by_source
+                .insert(scope, std::mem::take(&mut self.pins));
         }
         self.bookmarks = next_scope
             .as_ref()
             .and_then(|scope| self.bookmarks_by_source.get(scope))
+            .cloned()
+            .unwrap_or_default();
+        self.pins = next_scope
+            .as_ref()
+            .and_then(|scope| self.pins_by_source.get(scope))
             .cloned()
             .unwrap_or_default();
         self.bookmark_scope = next_scope;
@@ -1977,6 +2498,7 @@ impl ViewerApp {
             return;
         }
 
+        self.session_explorer.rebuild(&self.store);
         self.selected_row = None;
         self.last_discarded_events = self.store.discarded_events();
         self.search_generation = self.search_worker.next_generation();
@@ -1995,13 +2517,16 @@ impl ViewerApp {
     }
 
     fn replace_paths(&mut self, paths: Vec<PathBuf>) {
+        let paths = normalize_source_paths(paths);
         self.switch_bookmark_scope(&paths);
         self.reader = spawn_reader(paths.clone());
         self.store = EventStore::new(self.max_events);
+        self.session_explorer.reset();
         self.sources = paths;
         self.selected_row = None;
         self.invalid_records = 0;
         self.source_load_started_at.clear();
+        self.source_health.clear();
         self.last_error = None;
         self.last_discarded_events = 0;
         self.search_generation = self.search_worker.next_generation();
@@ -2041,8 +2566,12 @@ impl ViewerApp {
             stick_to_bottom: self.stick_to_bottom,
             color_by: self.color_by,
             bookmarks: self.bookmarks.clone(),
+            pins: self.pins.clone(),
+            facet_order: self.facet_order.clone(),
+            hidden_facets: self.hidden_facets.clone(),
             latest_at: self.latest_at,
             column_order: self.column_order.clone(),
+            relative_time_column: true,
             max_events: self.max_events,
             timestamp_display: self.timestamp_display,
             timestamp_format: self.timestamp_format.clone(),
@@ -2083,11 +2612,16 @@ impl ViewerApp {
                 self.stick_to_bottom = workspace.stick_to_bottom;
                 self.color_by = workspace.color_by;
                 self.latest_at = workspace.latest_at;
-                self.column_order = normalize_column_order(workspace.column_order);
+                self.column_order = normalize_saved_column_order(
+                    workspace.column_order,
+                    workspace.relative_time_column,
+                );
                 self.apply_event_limit(workspace.max_events);
                 self.timestamp_display = workspace.timestamp_display;
                 self.timestamp_format = workspace.timestamp_format;
                 self.group_errors = workspace.group_errors;
+                self.facet_order = normalize_facet_order(workspace.facet_order);
+                self.hidden_facets = workspace.hidden_facets;
                 self.replace_paths(workspace.sources);
                 self.workspace_path = Some(path.clone());
                 if let Some(scope) = &self.bookmark_scope {
@@ -2095,6 +2629,11 @@ impl ViewerApp {
                         .insert(scope.clone(), workspace.bookmarks.clone());
                 }
                 self.bookmarks = workspace.bookmarks;
+                if let Some(scope) = &self.bookmark_scope {
+                    self.pins_by_source
+                        .insert(scope.clone(), workspace.pins.clone());
+                }
+                self.pins = workspace.pins;
                 self.last_notice = Some(format!("Opened workspace {}", path.display()));
             }
             Ok(workspace) => {
@@ -2454,6 +2993,169 @@ impl ViewerApp {
         self.last_notice = Some(format!("Exporting {count} records to {}", path.display()));
     }
 
+    fn export_investigation(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("DeeBugee investigation", &["json"])
+            .set_file_name("deebugee-investigation.json")
+            .save_file()
+        else {
+            return;
+        };
+        let pinned: Vec<serde_json::Value> = self
+            .pins
+            .iter()
+            .map(|pin| {
+                serde_json::json!({
+                    "note": pin.note,
+                    "event": serde_json::from_str::<serde_json::Value>(&pin.event_json)
+                        .unwrap_or_else(|_| serde_json::Value::String(pin.event_json.clone())),
+                })
+            })
+            .collect();
+        let bundle = serde_json::json!({
+            "format": "deebugee-investigation-v1",
+            "created_at": Utc::now(),
+            "sources": self.sources,
+            "filter": self.filter,
+            "pins": pinned,
+        });
+        match std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&bundle).unwrap_or_default(),
+        ) {
+            Ok(()) => {
+                self.last_notice = Some(format!(
+                    "Exported {} pinned events to {}",
+                    self.pins.len(),
+                    path.display()
+                ))
+            }
+            Err(error) => {
+                self.last_error = Some(format!("Unable to export investigation: {error}"))
+            }
+        }
+    }
+
+    fn selected_pin_key(&self) -> Option<String> {
+        self.selected_row
+            .and_then(|row| self.store.get(row))
+            .map(event_pin_key)
+    }
+
+    fn toggle_selected_pin(&mut self) {
+        let Some(event) = self
+            .selected_row
+            .and_then(|row| self.store.get(row))
+            .cloned()
+        else {
+            return;
+        };
+        let key = event_pin_key(&event);
+        if let Some(index) = self.pins.iter().position(|pin| pin.key == key) {
+            self.pins.remove(index);
+            self.pin_note_edit = None;
+            self.last_notice = Some("Event unpinned".to_owned());
+        } else {
+            let event_json = serde_json::to_string(&event).unwrap_or_default();
+            self.pins.push(PinnedEvent {
+                key,
+                note: String::new(),
+                event_json,
+            });
+            self.pins
+                .sort_by_key(|pin| pin.event().map(|event| event.timestamp));
+            self.last_notice = Some("Event pinned".to_owned());
+        }
+    }
+
+    fn select_event_key(&mut self, key: &str) -> bool {
+        let Some(index) = self.table_rows.iter().copied().find(|index| {
+            self.store
+                .get(*index)
+                .is_some_and(|event| event_pin_key(event) == key)
+        }) else {
+            return false;
+        };
+        self.selected_row = Some(index);
+        self.scroll_to_selected_requested = true;
+        self.scroll_to_bottom_requested = false;
+        true
+    }
+
+    fn navigate_matching(&mut self, direction: i32, predicate: impl Fn(&LogEvent) -> bool) {
+        if self.table_rows.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_row
+            .and_then(|selected| self.table_rows.iter().position(|row| *row == selected));
+        let len = self.table_rows.len() as i32;
+        let start = current.map_or(if direction > 0 { -1 } else { 0 }, |value| value as i32);
+        for step in 1..=len {
+            let position = (start + direction * step).rem_euclid(len) as usize;
+            let index = self.table_rows[position];
+            if self.store.get(index).is_some_and(&predicate) {
+                self.selected_row = Some(index);
+                self.scroll_to_selected_requested = true;
+                self.scroll_to_bottom_requested = false;
+                break;
+            }
+        }
+    }
+
+    fn navigate_pin(&mut self, direction: i32) {
+        let keys: BTreeSet<String> = self.pins.iter().map(|pin| pin.key.clone()).collect();
+        self.navigate_matching(direction, |event| {
+            keys.contains(event_pin_key(event).as_str())
+        });
+    }
+
+    fn handle_keyboard_navigation(&mut self, context: &egui::Context) {
+        if context.egui_wants_keyboard_input() {
+            return;
+        }
+        let (up, down, next_error, previous_error, toggle_pin, edit_note, next_pin, previous_pin) =
+            context.input(|input| {
+                (
+                    input.key_pressed(egui::Key::ArrowUp) && !input.modifiers.ctrl,
+                    input.key_pressed(egui::Key::ArrowDown) && !input.modifiers.ctrl,
+                    input.key_pressed(egui::Key::F8) && !input.modifiers.shift,
+                    input.key_pressed(egui::Key::F8) && input.modifiers.shift,
+                    input.key_pressed(egui::Key::P),
+                    input.key_pressed(egui::Key::N),
+                    input.key_pressed(egui::Key::ArrowDown) && input.modifiers.ctrl,
+                    input.key_pressed(egui::Key::ArrowUp) && input.modifiers.ctrl,
+                )
+            });
+        if up {
+            self.navigate_matching(-1, |_| true);
+        }
+        if down {
+            self.navigate_matching(1, |_| true);
+        }
+        if next_error {
+            self.navigate_matching(1, is_error_event);
+        }
+        if previous_error {
+            self.navigate_matching(-1, is_error_event);
+        }
+        if next_pin {
+            self.navigate_pin(1);
+        }
+        if previous_pin {
+            self.navigate_pin(-1);
+        }
+        if toggle_pin {
+            self.toggle_selected_pin();
+        }
+        if edit_note
+            && let Some(key) = self.selected_pin_key()
+            && let Some(pin) = self.pins.iter().find(|pin| pin.key == key)
+        {
+            self.pin_note_edit = Some((key, pin.note.clone()));
+        }
+    }
+
     fn top_bar(&mut self, root: &mut egui::Ui) {
         let toolbar_frame = egui::Frame::new()
             .fill(SURFACE_1)
@@ -2505,6 +3207,17 @@ impl ViewerApp {
                             self.export_filtered();
                             ui.close();
                         }
+                        if ui
+                            .add_enabled(
+                                !self.pins.is_empty(),
+                                egui::Button::new("Export Investigation…"),
+                            )
+                            .on_hover_text("Export pinned events, notes, sources, and the active filter")
+                            .clicked()
+                        {
+                            self.export_investigation();
+                            ui.close();
+                        }
                     });
                     if self.project_root.is_some() {
                         ui.menu_button("Project", |ui| {
@@ -2514,33 +3227,31 @@ impl ViewerApp {
                             }
                         });
                     }
+                    if ui
+                        .selectable_label(self.session_explorer.open, "Sessions")
+                        .on_hover_text("Explore application runs and compare their outcomes")
+                        .clicked()
+                    {
+                        self.session_explorer.open = !self.session_explorer.open;
+                    }
                     self.settings_menu(ui);
-                    ui.menu_button("Help", |ui| {
-                        if let UpdateState::Available(update) = &self.update_state {
-                            ui.label(
-                                RichText::new(format!("Update {} Available", update.version))
-                                    .color(SUCCESS),
-                            );
-                            ui.separator();
-                        }
-                        let label = if matches!(self.update_state, UpdateState::Checking) {
-                            "Checking for Updates…"
-                        } else {
-                            "Check for Updates"
-                        };
-                        if ui
-                            .add_enabled(
-                                !matches!(self.update_state, UpdateState::Checking),
-                                egui::Button::new(label),
-                            )
-                            .clicked()
-                        {
-                            self.begin_update_check();
+                    self.source_health_menu(ui);
+                    ui.menu_button("Navigate", |ui| {
+                        if ui.button("First Error").clicked() {
+                            if let Some(index) = self.table_rows.iter().copied().find(|index| self.store.get(*index).is_some_and(is_error_event)) {
+                                self.selected_row = Some(index);
+                                self.scroll_to_selected_requested = true;
+                                self.scroll_to_bottom_requested = false;
+                            }
                             ui.close();
                         }
-                        if let UpdateState::Failed(error) = &self.update_state {
-                            ui.separator();
-                            ui.label(RichText::new(error).small().color(WARNING));
+                        if ui.button("Previous Error   Shift+F8").clicked() {
+                            self.navigate_matching(-1, is_error_event);
+                            ui.close();
+                        }
+                        if ui.button("Next Error   F8").clicked() {
+                            self.navigate_matching(1, is_error_event);
+                            ui.close();
                         }
                     });
 
@@ -2572,12 +3283,13 @@ impl ViewerApp {
                         [search_width, 30.0],
                         egui::TextEdit::singleline(&mut self.filter.text)
                             .vertical_align(egui::Align::Center)
-                            .hint_text("Search messages, events, subsystems, or fields…"),
+                            .hint_text("Search or enter field expressions…"),
+                    );
+                    search.clone().on_hover_text(
+                        "Examples: provider=remote · duration_ms>1000 · fields.retry_count>=3 · timestamp:last-5m",
                     );
                     if search.changed() {
-                        self.schedule_text_search(SEARCH_DEBOUNCE);
-                        self.tail_was_at_bottom = true;
-                        self.request_scroll_to_latest();
+                        self.query_text_changed();
                     }
                     if ui
                         .add_enabled(!self.filter.text.is_empty(), egui::Button::new("Clear"))
@@ -2658,6 +3370,8 @@ impl ViewerApp {
                     }
                 });
 
+                self.structured_query_bar(ui);
+
                 if let Some(error) = self.last_error.clone() {
                     ui.add_space(5.0);
                     egui::Frame::new()
@@ -2697,6 +3411,134 @@ impl ViewerApp {
                         });
                 }
             });
+    }
+
+    fn structured_query_bar(&mut self, ui: &mut egui::Ui) {
+        let parsed = parse_structured_query(&self.filter.text, Utc::now());
+        if parsed.predicates.is_empty() && parsed.errors.is_empty() {
+            return;
+        }
+
+        let mut remove_range = None;
+        ui.add_space(5.0);
+        ui.horizontal_wrapped(|ui| {
+            if !parsed.predicates.is_empty() {
+                ui.label(RichText::new("QUERY").strong().small().color(TEXT_MUTED));
+            }
+            for predicate in &parsed.predicates {
+                if ui
+                    .add(
+                        egui::Button::new(format!("{}  ×", predicate.label))
+                            .fill(ACCENT_SOFT)
+                            .stroke(Stroke::new(1.0, ACCENT)),
+                    )
+                    .on_hover_text("Remove this structured expression")
+                    .clicked()
+                {
+                    remove_range = Some(predicate.range.clone());
+                }
+            }
+        });
+
+        if !parsed.errors.is_empty() {
+            ui.add_space(4.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgb(56, 40, 24))
+                .inner_margin(egui::Margin::symmetric(9, 5))
+                .corner_radius(4.0)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Query").strong().color(WARNING));
+                        ui.label(
+                            RichText::new(
+                                parsed
+                                    .errors
+                                    .iter()
+                                    .map(|error| error.message.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" · "),
+                            )
+                            .color(WARNING),
+                        );
+                    });
+                });
+        }
+
+        if let Some(range) = remove_range {
+            self.filter.text = remove_query_expression(&self.filter.text, range);
+            self.query_text_changed();
+        }
+    }
+
+    fn source_health_menu(&mut self, ui: &mut egui::Ui) {
+        let mut source_paths: Vec<PathBuf> = self.source_health.keys().cloned().collect();
+        let configured_files: Vec<PathBuf> = self
+            .sources
+            .iter()
+            .filter(|path| !path.is_dir() && !source_paths.contains(path))
+            .cloned()
+            .collect();
+        source_paths.extend(configured_files);
+        source_paths.sort();
+        source_paths.dedup();
+        let problems = self
+            .source_health
+            .values()
+            .filter(|health| {
+                health.parse_errors > 0
+                    || health.rotations > 0
+                    || !matches!(health.state, SourceHealthState::Tailing)
+            })
+            .count();
+        let label = if problems == 0 {
+            format!("Sources {}", source_paths.len())
+        } else {
+            format!("Sources {} · {problems}!", source_paths.len())
+        };
+        ui.menu_button(
+            RichText::new(label).color(if problems == 0 { SUCCESS } else { WARNING }),
+            |ui| {
+                ui.set_min_width(420.0);
+                if source_paths.is_empty() {
+                    ui.label(RichText::new("No sources loaded").color(TEXT_MUTED));
+                }
+                for path in &source_paths {
+                    let health = self.source_health.get(path);
+                    let (state, color) = match health.map(|health| health.state) {
+                        Some(SourceHealthState::Loading) => ("Loading", ACCENT),
+                        Some(SourceHealthState::Tailing) => ("Tailing", SUCCESS),
+                        Some(SourceHealthState::Rotated) => ("Rotated", WARNING),
+                        Some(SourceHealthState::Missing) => ("Missing", DANGER),
+                        Some(SourceHealthState::Error) => ("Error", DANGER),
+                        None => ("Waiting", TEXT_MUTED),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(state).strong().color(color));
+                        ui.label(path.display().to_string());
+                    });
+                    if let Some(health) = health {
+                        if health.parse_errors > 0 {
+                            ui.label(
+                                RichText::new(format!("{} parse errors", health.parse_errors))
+                                    .small()
+                                    .color(WARNING),
+                            );
+                        }
+                        if health.rotations > 0 {
+                            ui.label(
+                                RichText::new(format!("{} rotations detected", health.rotations))
+                                    .small()
+                                    .color(WARNING),
+                            );
+                        }
+                        if let Some(detail) = &health.detail {
+                            ui.label(RichText::new(detail).small().color(TEXT_MUTED));
+                        }
+                    }
+                    ui.separator();
+                }
+            },
+        );
     }
 
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
@@ -2883,6 +3725,56 @@ impl ViewerApp {
             if commit_limit {
                 self.reload_current_sources();
             }
+
+            ui.separator();
+            ui.label(RichText::new("Facet Sections").strong());
+            ui.label(RichText::new("Show, hide, and order the filter sections.").small().color(TEXT_MUTED));
+            let facets = self.facet_order.clone();
+            let mut move_facet = None;
+            for (index, facet) in facets.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let mut visible = !self.hidden_facets.contains(facet);
+                    if ui.checkbox(&mut visible, facet_title(facet)).changed() {
+                        if visible { self.hidden_facets.remove(facet); } else { self.hidden_facets.insert(facet.clone()); }
+                        self.filters_dirty = true;
+                    }
+                    if ui.small_button("↑").on_hover_text("Move section up").clicked() && index > 0 {
+                        move_facet = Some((index, index - 1));
+                    }
+                    if ui.small_button("↓").on_hover_text("Move section down").clicked() && index + 1 < facets.len() {
+                        move_facet = Some((index, index + 1));
+                    }
+                });
+            }
+            if let Some((from, to)) = move_facet {
+                self.facet_order.swap(from, to);
+            }
+
+            ui.separator();
+            ui.label(RichText::new("About").strong());
+            ui.label(format!("DeeBugee v{}", env!("CARGO_PKG_VERSION")));
+            if let UpdateState::Available(update) = &self.update_state {
+                ui.label(
+                    RichText::new(format!("Update {} Available", update.version)).color(SUCCESS),
+                );
+            }
+            let update_label = if matches!(self.update_state, UpdateState::Checking) {
+                "Checking for Updates…"
+            } else {
+                "Check for Updates"
+            };
+            if ui
+                .add_enabled(
+                    !matches!(self.update_state, UpdateState::Checking),
+                    egui::Button::new(update_label),
+                )
+                .clicked()
+            {
+                self.begin_update_check();
+            }
+            if let UpdateState::Failed(error) = &self.update_state {
+                ui.label(RichText::new(error).small().color(WARNING));
+            }
         });
 
         if let Some(popup_response) = popup_response {
@@ -2940,64 +3832,104 @@ impl ViewerApp {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let button_height = ui.spacing().interact_size.y.max(26.0);
                         if ui
-                            .add_enabled(active_filter_count > 0, egui::Button::new("Reset"))
+                            .add_enabled_ui(active_filter_count > 0, |ui| {
+                                ui.add_sized([52.0, button_height], egui::Button::new("Reset"))
+                            })
+                            .inner
                             .clicked()
                         {
                             self.filter.clear();
                             self.filter_changed();
                         }
+                        let label = if self.facet_sections_expanded {
+                            "Collapse All"
+                        } else {
+                            "Expand All"
+                        };
+                        if ui
+                            .add_sized([82.0, button_height], egui::Button::new(label))
+                            .clicked()
+                        {
+                            self.facet_sections_expanded = !self.facet_sections_expanded;
+                            self.facet_sections_request = Some(self.facet_sections_expanded);
+                        }
                     });
                 });
                 ui.separator();
 
+                ui.horizontal(|ui| {
+                    let control_height = ui.spacing().interact_size.y.max(26.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled_ui(!self.facet_search.is_empty(), |ui| {
+                                ui.add_sized([48.0, control_height], egui::Button::new("Clear"))
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            self.facet_search.clear();
+                        }
+                        let search_width = ui.available_width().max(80.0);
+                        let search_response = ui.add_sized(
+                            [search_width, control_height],
+                            egui::TextEdit::singleline(&mut self.facet_search)
+                                .vertical_align(egui::Align::Center),
+                        );
+                        if self.facet_search.is_empty() {
+                            ui.painter().text(
+                                search_response.rect.left_center() + egui::vec2(4.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                "Search facet values…",
+                                egui::TextStyle::Body.resolve(ui.style()),
+                                ui.visuals().weak_text_color(),
+                            );
+                        }
+                    });
+                });
+                ui.add_space(3.0);
+
+                let facet_sections_request = self.facet_sections_request.take();
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for facet in DISPLAYED_FACETS {
-                        let counts = self.facet_counts.get(facet).cloned().unwrap_or_default();
+                    let search = self.facet_search.trim().to_ascii_lowercase();
+                    let facets = self.displayed_facets();
+                    for facet in facets {
+                        let counts: Vec<(String, u64)> = self
+                            .facet_counts
+                            .get(&facet)
+                            .into_iter()
+                            .flatten()
+                            .filter(|(value, _)| facet_value_matches_search(value, &search))
+                            .take(100)
+                            .cloned()
+                            .collect();
+                        let has_search_result = !search.is_empty() && !counts.is_empty();
                         let active = self
                             .filter
                             .facets
-                            .get(facet)
+                            .get(&facet)
                             .is_some_and(|selection| !selection.is_empty());
                         let title = if active {
-                            RichText::new(facet_title(facet)).strong().color(ACCENT)
+                            RichText::new(facet_title(&facet)).strong().color(ACCENT)
                         } else {
-                            RichText::new(facet_title(facet)).strong()
+                            RichText::new(facet_title(&facet)).strong()
                         };
 
                         egui::CollapsingHeader::new(title)
-                            .default_open(matches!(facet, "level" | "source" | "subsystem"))
+                            .default_open(matches!(
+                                facet.as_str(),
+                                "level" | "source" | "subsystem"
+                            ))
+                            .open(facet_section_open_request(
+                                has_search_result,
+                                facet_sections_request,
+                            ))
                             .show(ui, |ui| {
-                                for (value, count) in counts.into_iter().take(100) {
-                                    self.facet_value_row(ui, facet, &value, count);
-                                }
-                            });
-                    }
-
-                    let extra_facets: Vec<_> = self
-                        .store
-                        .facet_names()
-                        .filter(|facet| {
-                            facet.starts_with("fields.")
-                                && !PRIMARY_FACETS.contains(facet)
-                                && !DISPLAYED_FACETS.contains(facet)
-                        })
-                        .map(str::to_string)
-                        .collect();
-                    if !extra_facets.is_empty() {
-                        ui.separator();
-                        ui.label(RichText::new("Discovered Fields").strong());
-                    }
-                    for facet in extra_facets {
-                        let counts = self.facet_counts.get(&facet).cloned().unwrap_or_default();
-                        egui::CollapsingHeader::new(facet.trim_start_matches("fields.")).show(
-                            ui,
-                            |ui| {
-                                for (value, count) in counts.into_iter().take(100) {
+                                for (value, count) in counts {
                                     self.facet_value_row(ui, &facet, &value, count);
                                 }
-                            },
-                        );
+                            });
                     }
                 });
             });
@@ -3156,6 +4088,124 @@ impl ViewerApp {
         }
     }
 
+    fn pin_bar(&mut self, ui: &mut egui::Ui) {
+        if self.pins.is_empty() {
+            return;
+        }
+        let mut previous_timestamp = None;
+        let summaries: Vec<(String, String)> = self
+            .pins
+            .iter()
+            .map(|pin| {
+                let label = pin.event().map_or_else(
+                    || "Unavailable event".to_owned(),
+                    |event| {
+                        let delta = previous_timestamp
+                            .map(|previous| {
+                                format!(
+                                    "{} · ",
+                                    format_relative_elapsed(event.timestamp - previous)
+                                )
+                            })
+                            .unwrap_or_default();
+                        previous_timestamp = Some(event.timestamp);
+                        format!(
+                            "{delta}{} · {}",
+                            event.event,
+                            compact_identifier(event.correlation_id(), 14)
+                        )
+                    },
+                );
+                (pin.key.clone(), label)
+            })
+            .collect();
+        egui::Frame::new()
+            .fill(SURFACE_2)
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("Pins {}", self.pins.len()))
+                            .strong()
+                            .color(ACCENT),
+                    );
+                    if ui
+                        .small_button("← Previous")
+                        .on_hover_text("Ctrl+Up")
+                        .clicked()
+                    {
+                        self.navigate_pin(-1);
+                    }
+                    if ui
+                        .small_button("Next →")
+                        .on_hover_text("Ctrl+Down")
+                        .clicked()
+                    {
+                        self.navigate_pin(1);
+                    }
+                    if self.pins.len() >= 2
+                        && let (Some(first), Some(last)) = (
+                            self.pins.first().and_then(PinnedEvent::event),
+                            self.pins.last().and_then(PinnedEvent::event),
+                        )
+                    {
+                        ui.label(
+                            RichText::new(format!(
+                                "span {}",
+                                format_relative_elapsed(last.timestamp - first.timestamp)
+                            ))
+                            .small()
+                            .color(TEXT_MUTED),
+                        );
+                    }
+                    for (key, label) in &summaries {
+                        if ui.small_button(label).clicked() {
+                            self.select_event_key(key);
+                        }
+                    }
+                });
+            });
+        ui.add_space(4.0);
+    }
+
+    fn pin_note_window(&mut self, context: &egui::Context) {
+        let Some((key, mut note)) = self.pin_note_edit.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Investigation Note")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(430.0)
+            .open(&mut open)
+            .show(context, |ui| {
+                ui.label(
+                    RichText::new("Saved with this pinned event.")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+                ui.add(
+                    egui::TextEdit::multiline(&mut note)
+                        .desired_rows(6)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    save = ui.button("Save Note").clicked();
+                    cancel = ui.button("Cancel").clicked()
+                        || ui.input(|input| input.key_pressed(egui::Key::Escape));
+                });
+            });
+        if save {
+            if let Some(pin) = self.pins.iter_mut().find(|pin| pin.key == key) {
+                pin.note = note;
+            }
+        } else if open && !cancel {
+            self.pin_note_edit = Some((key, note));
+        }
+    }
+
     fn details_panel(&mut self, root: &mut egui::Ui) {
         let Some(event) = self
             .selected_row
@@ -3212,6 +4262,26 @@ impl ViewerApp {
                             .unwrap_or_else(|error| format!("Unable to serialize event: {error}"));
                         ui.ctx().copy_text(format!("{}\n\n{}", event.message, raw));
                     }
+                    if ui.button("Copy Correlation").clicked() {
+                        ui.ctx().copy_text(event.correlation_id().to_owned());
+                    }
+                    let pinned = self
+                        .selected_pin_key()
+                        .is_some_and(|key| self.pins.iter().any(|pin| pin.key == key));
+                    if ui
+                        .button(if pinned { "Unpin" } else { "Pin" })
+                        .on_hover_text("P")
+                        .clicked()
+                    {
+                        self.toggle_selected_pin();
+                    }
+                    if pinned
+                        && ui.button("Note…").on_hover_text("N").clicked()
+                        && let Some(key) = self.selected_pin_key()
+                        && let Some(pin) = self.pins.iter().find(|pin| pin.key == key)
+                    {
+                        self.pin_note_edit = Some((key, pin.note.clone()));
+                    }
                     if ui.button("Filter By Correlation").clicked() {
                         self.filter.correlation = Some(event.correlation_id().to_string());
                         self.filter_changed();
@@ -3246,6 +4316,23 @@ impl ViewerApp {
                         ui.label(RichText::new(detail).small().color(TEXT_MUTED));
                     }
                     ui.separator();
+                    if !event.fields.is_empty() {
+                        ui.label(RichText::new("Fields").strong());
+                        egui::Grid::new("event_field_paths")
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for (name, value) in &event.fields {
+                                    let path = format!("fields.{name}");
+                                    ui.monospace(&path);
+                                    ui.label(compact_identifier(&value.to_string(), 80));
+                                    if ui.small_button("Copy Path").clicked() {
+                                        ui.ctx().copy_text(path);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        ui.separator();
+                    }
                     let mut raw = serde_json::to_string_pretty(&event)
                         .unwrap_or_else(|error| format!("Unable to serialize event: {error}"));
                     ui.add(
@@ -3256,6 +4343,108 @@ impl ViewerApp {
                     );
                 });
             });
+    }
+
+    fn session_explorer_window(&mut self, context: &egui::Context) {
+        if !self.session_explorer.open {
+            return;
+        }
+
+        let summaries = self.session_explorer.sorted_summaries();
+        let mut open = true;
+        let mut compare_a = self.session_explorer.compare_a.clone();
+        let mut compare_b = self.session_explorer.compare_b.clone();
+        let mut filter_session = None;
+        let timestamp_display = self.timestamp_display;
+        let timestamp_format = self.timestamp_format.clone();
+
+        egui::Window::new("Session Explorer")
+            .id(egui::Id::new("session_explorer"))
+            .open(&mut open)
+            .default_size(egui::vec2(920.0, 620.0))
+            .min_size(egui::vec2(680.0, 380.0))
+            .resizable(true)
+            .show(context, |ui| {
+                if summaries.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("No application sessions are loaded yet.")
+                                .color(TEXT_MUTED),
+                        );
+                    });
+                    return;
+                }
+
+                ui.horizontal(|ui| {
+                    ui.heading("Application Runs");
+                    ui.label(
+                        RichText::new(format!("{} sessions", summaries.len()))
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                compare_a.is_some() || compare_b.is_some(),
+                                egui::Button::new("Clear Comparison"),
+                            )
+                            .clicked()
+                        {
+                            compare_a = None;
+                            compare_b = None;
+                        }
+                    });
+                });
+                ui.label(
+                    RichText::new(
+                        "Mark two runs as A and B to compare event coverage, outcomes, errors, and timing.",
+                    )
+                    .small()
+                    .color(TEXT_MUTED),
+                );
+                ui.separator();
+
+                ui.columns(2, |columns| {
+                    columns[0].set_min_width(300.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("session_list")
+                        .show(&mut columns[0], |ui| {
+                            for summary in &summaries {
+                                session_summary_card(
+                                    ui,
+                                    summary,
+                                    timestamp_display,
+                                    &timestamp_format,
+                                    &mut compare_a,
+                                    &mut compare_b,
+                                    &mut filter_session,
+                                );
+                                ui.add_space(6.0);
+                            }
+                        });
+
+                    columns[1].set_min_width(360.0);
+                    session_comparison_ui(
+                        &mut columns[1],
+                        &summaries,
+                        compare_a.as_deref(),
+                        compare_b.as_deref(),
+                    );
+                });
+            });
+
+        self.session_explorer.open = open;
+        self.session_explorer.compare_a = compare_a;
+        self.session_explorer.compare_b = compare_b;
+        if let Some(session_id) = filter_session {
+            self.filter.correlation = None;
+            self.filter
+                .facets
+                .entry("app_session_id".to_string())
+                .or_default()
+                .include_only(session_id);
+            self.filter_changed();
+        }
     }
 
     fn central_table(&mut self, root: &mut egui::Ui) {
@@ -3284,6 +4473,7 @@ impl ViewerApp {
             }
 
             self.bookmark_bar(ui);
+            self.pin_bar(ui);
 
             let row_height = ui.text_style_height(&TextStyle::Body) + 8.0;
             // Capture this before the nested table consumes it. We apply it only after
@@ -3303,6 +4493,19 @@ impl ViewerApp {
             let timestamp_display = self.timestamp_display;
             let timestamp_format = &self.timestamp_format;
             let scroll_to_bottom_requested = self.scroll_to_bottom_requested;
+            let scroll_to_selected_requested = self.scroll_to_selected_requested;
+            let selected_scroll_row = self.selected_row.and_then(|selected| {
+                self.table_rows.iter().position(|row| *row == selected)
+            });
+            let mut session_starts = BTreeMap::<String, DateTime<Utc>>::new();
+            for index in table_rows {
+                if let Some(event) = store.get(*index) {
+                    session_starts
+                        .entry(event.app_session_id.clone())
+                        .and_modify(|timestamp| *timestamp = (*timestamp).min(event.timestamp))
+                        .or_insert(event.timestamp);
+                }
+            }
             // Labels are normally selectable so log text can be copied. egui's
             // selection handler treats every pointer button as a drag source,
             // including the middle button we reserve for table panning.
@@ -3351,6 +4554,10 @@ impl ViewerApp {
                                 .scroll_to_row(table_rows.len(), Some(egui::Align::BOTTOM)),
                         }
                         .animate_scrolling(false);
+                    } else if scroll_to_selected_requested
+                        && let Some(row) = selected_scroll_row
+                    {
+                        table = table.scroll_to_row(row, Some(egui::Align::Center)).animate_scrolling(false);
                     }
 
                     table
@@ -3503,6 +4710,7 @@ impl ViewerApp {
                                                 semantic_highlighting,
                                                 timestamp_display,
                                                 timestamp_format,
+                                                relative_start: session_starts.get(&event.app_session_id).copied(),
                                                 group_detail: group_detail.as_deref(),
                                             },
                                         );
@@ -3612,6 +4820,7 @@ impl ViewerApp {
             }
 
             self.selected_row = selected;
+            self.scroll_to_selected_requested = false;
             if let Some((source, target, insert_after)) = requested_move {
                 move_column(&mut self.column_order, source, target, insert_after);
             }
@@ -3778,6 +4987,7 @@ struct EventCellOptions<'a> {
     semantic_highlighting: bool,
     timestamp_display: TimestampDisplay,
     timestamp_format: &'a str,
+    relative_start: Option<DateTime<Utc>>,
     group_detail: Option<&'a str>,
 }
 
@@ -3798,6 +5008,13 @@ fn show_event_cell(
                 .monospace()
                 .color(TEXT_MUTED),
             );
+        }
+        TableColumn::RelativeTime => {
+            let value = options
+                .relative_start
+                .map(|start| format_relative_elapsed(event.timestamp - start))
+                .unwrap_or_else(|| "—".to_owned());
+            ui.label(RichText::new(value).monospace().color(TEXT_MUTED));
         }
         TableColumn::Level => {
             ui.label(
@@ -3874,6 +5091,39 @@ fn show_event_cell(
 
 fn is_groupable_event(_event: &LogEvent) -> bool {
     true
+}
+
+fn is_error_event(event: &LogEvent) -> bool {
+    matches!(event.level, Level::Error | Level::Fatal)
+}
+
+fn event_pin_key(event: &LogEvent) -> String {
+    let json = serde_json::to_vec(event).unwrap_or_default();
+    let hash = json.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("{hash:016x}")
+}
+
+fn format_relative_elapsed(duration: chrono::Duration) -> String {
+    let milliseconds = duration.num_milliseconds();
+    let sign = if milliseconds < 0 { "-" } else { "+" };
+    let absolute = milliseconds.unsigned_abs();
+    if absolute < 60_000 {
+        format!("{sign}{:.3}s", absolute as f64 / 1_000.0)
+    } else if absolute < 3_600_000 {
+        format!(
+            "{sign}{}m {:.3}s",
+            absolute / 60_000,
+            (absolute % 60_000) as f64 / 1_000.0
+        )
+    } else {
+        format!(
+            "{sign}{}h {:02}m",
+            absolute / 3_600_000,
+            (absolute % 3_600_000) / 60_000
+        )
+    }
 }
 
 fn error_group_key(event: &LogEvent) -> String {
@@ -4145,6 +5395,7 @@ impl eframe::App for ViewerApp {
                 .collect()
         });
         self.add_paths(dropped_paths);
+        self.handle_keyboard_navigation(ui.ctx());
 
         if !self.paused && self.tail_was_at_bottom {
             if self.filter.text.trim().is_empty() {
@@ -4175,6 +5426,8 @@ impl eframe::App for ViewerApp {
         self.sidebar(ui);
         self.details_panel(ui);
         self.central_table(ui);
+        self.session_explorer_window(ui.ctx());
+        self.pin_note_window(ui.ctx());
         self.update_dialog(ui.ctx());
 
         ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -4188,17 +5441,26 @@ impl eframe::App for ViewerApp {
         if let Some(scope) = &self.bookmark_scope {
             bookmarks_by_source.insert(scope.clone(), self.bookmarks.clone());
         }
+        let mut pins_by_source = self.pins_by_source.clone();
+        if let Some(scope) = &self.bookmark_scope {
+            pins_by_source.insert(scope.clone(), self.pins.clone());
+        }
         let preferences = ViewerPreferences {
             version: 1,
             sources: self.sources.clone(),
             filter: self.filter.clone(),
             column_order: self.column_order.clone(),
+            relative_time_column: true,
             wrapped_messages: self.wrapped_messages,
             semantic_highlighting: self.semantic_highlighting,
             stick_to_bottom: self.stick_to_bottom,
             color_by: self.color_by,
             bookmarks: self.bookmarks.clone(),
             bookmarks_by_source,
+            pins: self.pins.clone(),
+            pins_by_source,
+            facet_order: self.facet_order.clone(),
+            hidden_facets: self.hidden_facets.clone(),
             latest_at: self.latest_at,
             max_events: self.max_events,
             timestamp_display: self.timestamp_display,
@@ -4211,6 +5473,280 @@ impl eframe::App for ViewerApp {
 
     fn auto_save_interval(&self) -> Duration {
         Duration::from_secs(5)
+    }
+}
+
+fn session_summary_card(
+    ui: &mut egui::Ui,
+    summary: &SessionSummary,
+    timestamp_display: TimestampDisplay,
+    timestamp_format: &str,
+    compare_a: &mut Option<String>,
+    compare_b: &mut Option<String>,
+    filter_session: &mut Option<String>,
+) {
+    egui::Frame::new()
+        .fill(SURFACE_2)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(compact_identifier(&summary.id, 22))
+                        .strong()
+                        .monospace(),
+                )
+                .on_hover_text(&summary.id);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("View").clicked() {
+                        *filter_session = Some(summary.id.clone());
+                    }
+                    if ui
+                        .selectable_label(compare_b.as_deref() == Some(&summary.id), "B")
+                        .on_hover_text("Use this run as comparison B")
+                        .clicked()
+                    {
+                        *compare_b = toggle_session_choice(
+                            compare_b.take(),
+                            &summary.id,
+                            compare_a.as_deref(),
+                        );
+                    }
+                    if ui
+                        .selectable_label(compare_a.as_deref() == Some(&summary.id), "A")
+                        .on_hover_text("Use this run as comparison A")
+                        .clicked()
+                    {
+                        *compare_a = toggle_session_choice(
+                            compare_a.take(),
+                            &summary.id,
+                            compare_b.as_deref(),
+                        );
+                    }
+                });
+            });
+            ui.label(
+                RichText::new(
+                    timestamp_display.format_timestamp(summary.first_timestamp, timestamp_format),
+                )
+                .small()
+                .color(TEXT_MUTED),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{} events", summary.event_count));
+                ui.label(format_elapsed(summary.elapsed_ms()));
+                if summary.warning_count > 0 {
+                    ui.label(
+                        RichText::new(format!("{} warnings", summary.warning_count)).color(WARNING),
+                    );
+                }
+                if summary.error_count > 0 {
+                    ui.label(
+                        RichText::new(format!("{} errors", summary.error_count)).color(DANGER),
+                    );
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if !summary.providers.is_empty() {
+                    ui.label(
+                        RichText::new(format!(
+                            "Providers: {}",
+                            summary
+                                .providers
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                        .small()
+                        .color(TEXT_MUTED),
+                    );
+                }
+                if !summary.correlations.is_empty() {
+                    ui.label(
+                        RichText::new(format!("{} correlations", summary.correlations.len()))
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                }
+                if let Some(status) = summary.status() {
+                    ui.label(
+                        RichText::new(format!("Final: {status}"))
+                            .small()
+                            .color(ACCENT),
+                    );
+                }
+            });
+        });
+}
+
+fn session_comparison_ui(
+    ui: &mut egui::Ui,
+    summaries: &[SessionSummary],
+    compare_a: Option<&str>,
+    compare_b: Option<&str>,
+) {
+    ui.heading("Run Comparison");
+    let Some(left) = compare_a.and_then(|id| summaries.iter().find(|summary| summary.id == id))
+    else {
+        ui.label(RichText::new("Choose run A from the session list.").color(TEXT_MUTED));
+        return;
+    };
+    let Some(right) = compare_b.and_then(|id| summaries.iter().find(|summary| summary.id == id))
+    else {
+        ui.label(RichText::new("Choose run B from the session list.").color(TEXT_MUTED));
+        return;
+    };
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(format!("A  {}", compact_identifier(&left.id, 18))).strong());
+        ui.label(RichText::new("versus").small().color(TEXT_MUTED));
+        ui.label(RichText::new(format!("B  {}", compact_identifier(&right.id, 18))).strong());
+    });
+    ui.horizontal_wrapped(|ui| {
+        comparison_metric(
+            ui,
+            "Events",
+            left.event_count.to_string(),
+            right.event_count.to_string(),
+            left.event_count != right.event_count,
+        );
+        comparison_metric(
+            ui,
+            "Errors",
+            left.error_count.to_string(),
+            right.error_count.to_string(),
+            left.error_count != right.error_count,
+        );
+        comparison_metric(
+            ui,
+            "Elapsed",
+            format_elapsed(left.elapsed_ms()),
+            format_elapsed(right.elapsed_ms()),
+            left.elapsed_ms() != right.elapsed_ms(),
+        );
+    });
+    ui.separator();
+
+    let rows = compare_sessions(left, right);
+    let changed = rows.iter().filter(|row| row.differs()).count();
+    ui.label(
+        RichText::new(format!(
+            "{changed} differing event types · {} total",
+            rows.len()
+        ))
+        .small()
+        .color(if changed > 0 { WARNING } else { SUCCESS }),
+    );
+    ui.add_space(4.0);
+    egui::ScrollArea::both()
+        .id_salt("session_comparison")
+        .show(ui, |ui| {
+            egui::Grid::new("session_comparison_grid")
+                .striped(true)
+                .min_col_width(58.0)
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Event").strong());
+                    ui.label(RichText::new("Count A/B").strong());
+                    ui.label(RichText::new("Warn A/B").strong());
+                    ui.label(RichText::new("Error A/B").strong());
+                    ui.label(RichText::new("Avg ms A/B").strong());
+                    ui.label(RichText::new("Status A/B").strong());
+                    ui.end_row();
+                    for row in rows {
+                        let color = if row.differs() { WARNING } else { TEXT_PRIMARY };
+                        ui.label(RichText::new(&row.event).color(color))
+                            .on_hover_text(format!(
+                                "Maximum duration: {} / {}",
+                                format_optional_duration(row.max_duration_a),
+                                format_optional_duration(row.max_duration_b)
+                            ));
+                        ui.label(format!("{} / {}", row.count_a, row.count_b));
+                        ui.label(format!("{} / {}", row.warnings_a, row.warnings_b));
+                        ui.label(format!("{} / {}", row.errors_a, row.errors_b));
+                        ui.label(format!(
+                            "{} / {}",
+                            format_optional_duration(row.average_duration_a),
+                            format_optional_duration(row.average_duration_b)
+                        ));
+                        ui.label(format!(
+                            "{} / {}",
+                            row.status_a.as_deref().unwrap_or("-"),
+                            row.status_b.as_deref().unwrap_or("-")
+                        ));
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn comparison_metric(ui: &mut egui::Ui, name: &str, left: String, right: String, differs: bool) {
+    egui::Frame::new()
+        .fill(SURFACE_2)
+        .corner_radius(5)
+        .inner_margin(egui::Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(name).small().color(TEXT_MUTED));
+                ui.label(
+                    RichText::new(format!("{left} / {right}"))
+                        .strong()
+                        .color(if differs { WARNING } else { SUCCESS }),
+                );
+            });
+        });
+}
+
+fn toggle_session_choice(
+    current: Option<String>,
+    requested: &str,
+    other: Option<&str>,
+) -> Option<String> {
+    if current.as_deref() == Some(requested) {
+        None
+    } else if other == Some(requested) {
+        current
+    } else {
+        Some(requested.to_string())
+    }
+}
+
+fn compact_identifier(value: &str, max_characters: usize) -> String {
+    if value.chars().count() <= max_characters {
+        return value.to_string();
+    }
+    let visible = max_characters.saturating_sub(1);
+    format!("{}…", value.chars().take(visible).collect::<String>())
+}
+
+fn format_elapsed(milliseconds: i64) -> String {
+    if milliseconds < 1_000 {
+        format!("{milliseconds} ms")
+    } else if milliseconds < 60_000 {
+        format!("{:.1} s", milliseconds as f64 / 1_000.0)
+    } else {
+        let minutes = milliseconds / 60_000;
+        let seconds = (milliseconds % 60_000) / 1_000;
+        format!("{minutes}m {seconds:02}s")
+    }
+}
+
+fn format_optional_duration(duration_ms: Option<f64>) -> String {
+    duration_ms.map_or_else(|| "-".to_string(), |duration| format!("{duration:.1}"))
+}
+
+fn remove_query_expression(query: &str, range: Range<usize>) -> String {
+    if range.start > range.end || range.end > query.len() {
+        return query.to_string();
+    }
+    let before = query[..range.start].trim_end();
+    let after = query[range.end..].trim_start();
+    match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => after.to_string(),
+        (false, true) => before.to_string(),
+        (false, false) => format!("{before} {after}"),
     }
 }
 
@@ -4272,6 +5808,31 @@ fn facet_title(facet: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn facet_value_matches_search(value: &str, normalized_search: &str) -> bool {
+    normalized_search.is_empty() || value.to_ascii_lowercase().contains(normalized_search)
+}
+
+fn facet_section_open_request(
+    has_search_result: bool,
+    expand_collapse_all: Option<bool>,
+) -> Option<bool> {
+    if has_search_result {
+        Some(true)
+    } else {
+        expand_collapse_all
+    }
+}
+
+fn normalize_source_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut normalized: Vec<PathBuf> = paths
+        .into_iter()
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .collect();
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 fn bookmark_scope_key(paths: &[PathBuf]) -> Option<String> {
@@ -4559,6 +6120,11 @@ mod tests {
         assert_eq!(normalized[0], TableColumn::Message);
         assert_eq!(normalized[1], TableColumn::Source);
         assert_eq!(normalized.len(), TableColumn::ALL.len());
+        let timestamp = normalized
+            .iter()
+            .position(|column| *column == TableColumn::Timestamp)
+            .unwrap();
+        assert_eq!(normalized[timestamp + 1], TableColumn::RelativeTime);
         for column in TableColumn::ALL {
             assert_eq!(
                 normalized
@@ -4731,6 +6297,21 @@ mod tests {
     }
 
     #[test]
+    fn structured_query_chips_remove_only_their_expression() {
+        let query = "sync duration_ms > 1000 provider=remote";
+        let parsed = parse_structured_query(query, Utc::now());
+        assert_eq!(parsed.predicates.len(), 2);
+
+        let without_duration = remove_query_expression(query, parsed.predicates[0].range.clone());
+        assert_eq!(without_duration, "sync provider=remote");
+
+        let reparsed = parse_structured_query(&without_duration, Utc::now());
+        let without_provider =
+            remove_query_expression(&without_duration, reparsed.predicates[0].range.clone());
+        assert_eq!(without_provider, "sync");
+    }
+
+    #[test]
     fn bookmark_scopes_are_stable_per_jsonl_source_set() {
         let alpha = PathBuf::from("C:/logs/alpha.jsonl");
         let beta = PathBuf::from("C:/logs/beta.jsonl");
@@ -4893,5 +6474,187 @@ sources = ["logs"]
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn session_event(
+        session: &str,
+        event_name: &str,
+        timestamp: &str,
+        level: Level,
+        duration_ms: Option<f64>,
+        status: Option<&str>,
+    ) -> LogEvent {
+        let mut event = LogEvent::new(
+            level,
+            "test",
+            "session-test",
+            event_name,
+            "[Session Test] Event",
+            session,
+        );
+        event.timestamp = timestamp.parse().unwrap();
+        event.duration_ms = duration_ms;
+        event.status = status.map(|value| serde_json::Value::String(value.to_string()));
+        event
+    }
+
+    #[test]
+    fn session_summaries_keep_outcomes_and_timing_correct_when_events_are_out_of_order() {
+        let later = session_event(
+            "run-a",
+            "sync.completed",
+            "2026-08-22T10:00:03Z",
+            Level::Info,
+            Some(120.0),
+            Some("completed"),
+        );
+        let mut earlier = session_event(
+            "run-a",
+            "sync.started",
+            "2026-08-22T10:00:00Z",
+            Level::Warn,
+            None,
+            Some("started"),
+        );
+        earlier.provider = Some("local".to_string());
+        earlier.request_id = Some("request-1".to_string());
+
+        let mut explorer = SessionExplorerState::default();
+        explorer.observe_many(&[later, earlier]);
+
+        let summary = explorer.summaries.get("run-a").unwrap();
+        assert_eq!(summary.event_count, 2);
+        assert_eq!(summary.warning_count, 1);
+        assert_eq!(summary.error_count, 0);
+        assert_eq!(summary.elapsed_ms(), 3_000);
+        assert_eq!(summary.status(), Some("completed"));
+        assert!(summary.providers.contains("local"));
+        assert!(summary.correlations.contains("request-1"));
+    }
+
+    #[test]
+    fn session_comparison_prioritizes_missing_and_changed_event_types() {
+        let mut left = SessionSummary::new(&session_event(
+            "run-a",
+            "sync.started",
+            "2026-08-22T10:00:00Z",
+            Level::Info,
+            Some(100.0),
+            Some("started"),
+        ));
+        left.observe(&session_event(
+            "run-a",
+            "sync.completed",
+            "2026-08-22T10:00:01Z",
+            Level::Info,
+            Some(200.0),
+            Some("completed"),
+        ));
+        let mut right = SessionSummary::new(&session_event(
+            "run-b",
+            "sync.started",
+            "2026-08-22T11:00:00Z",
+            Level::Info,
+            Some(240.0),
+            Some("started"),
+        ));
+        right.observe(&session_event(
+            "run-b",
+            "sync.failed",
+            "2026-08-22T11:00:01Z",
+            Level::Error,
+            Some(500.0),
+            Some("failed"),
+        ));
+
+        let rows = compare_sessions(&left, &right);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(SessionComparisonRow::differs));
+        assert!(rows[0].count_a == 0 || rows[0].count_b == 0);
+
+        let started = rows.iter().find(|row| row.event == "sync.started").unwrap();
+        assert_eq!(started.count_a, 1);
+        assert_eq!(started.count_b, 1);
+        assert_eq!(started.average_duration_a, Some(100.0));
+        assert_eq!(started.average_duration_b, Some(240.0));
+    }
+
+    #[test]
+    fn comparison_slots_cannot_select_the_same_session() {
+        assert_eq!(toggle_session_choice(None, "run-a", Some("run-a")), None);
+        assert_eq!(
+            toggle_session_choice(Some("run-a".to_string()), "run-a", None),
+            None
+        );
+        assert_eq!(
+            toggle_session_choice(None, "run-b", Some("run-a")),
+            Some("run-b".to_string())
+        );
+    }
+
+    #[test]
+    fn pinned_events_and_notes_round_trip_through_workspace_toml() {
+        let event = session_event(
+            "run-pin",
+            "sync.failed",
+            "2026-08-22T10:00:01Z",
+            Level::Error,
+            Some(420.0),
+            Some("failed"),
+        );
+        let mut workspace = WorkspaceConfig::new(vec![PathBuf::from("test.jsonl")]);
+        workspace.pins.push(PinnedEvent {
+            key: event_pin_key(&event),
+            note: "Retry started after the provider timeout".to_owned(),
+            event_json: serde_json::to_string(&event).unwrap(),
+        });
+
+        let encoded = toml::to_string(&workspace).unwrap();
+        let decoded: WorkspaceConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.pins, workspace.pins);
+        assert_eq!(decoded.pins[0].event(), Some(event));
+    }
+
+    #[test]
+    fn facet_layout_is_deduplicated_and_forward_compatible() {
+        let order = normalize_facet_order(vec![
+            "status".to_owned(),
+            "fields.job".to_owned(),
+            "status".to_owned(),
+        ]);
+        assert_eq!(&order[..2], ["status", "fields.job"]);
+        assert!(
+            DISPLAYED_FACETS
+                .iter()
+                .all(|facet| order.contains(&(*facet).to_owned()))
+        );
+    }
+
+    #[test]
+    fn facet_value_search_is_case_insensitive_and_empty_search_matches_all() {
+        assert!(facet_value_matches_search("Remote Provider", "provider"));
+        assert!(facet_value_matches_search("Remote Provider", "remote"));
+        assert!(facet_value_matches_search("Remote Provider", ""));
+        assert!(!facet_value_matches_search("Local Cache", "remote"));
+    }
+
+    #[test]
+    fn facet_search_results_stay_open_during_expand_collapse_all_requests() {
+        assert_eq!(facet_section_open_request(false, Some(true)), Some(true));
+        assert_eq!(facet_section_open_request(false, Some(false)), Some(false));
+        assert_eq!(facet_section_open_request(true, Some(false)), Some(true));
+        assert_eq!(facet_section_open_request(false, None), None);
+    }
+
+    #[test]
+    fn relative_time_is_signed_and_millisecond_precise() {
+        assert_eq!(
+            format_relative_elapsed(chrono::Duration::milliseconds(1_842)),
+            "+1.842s"
+        );
+        assert_eq!(
+            format_relative_elapsed(chrono::Duration::milliseconds(-25)),
+            "-0.025s"
+        );
     }
 }
