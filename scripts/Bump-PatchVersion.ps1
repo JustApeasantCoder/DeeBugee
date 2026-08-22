@@ -11,15 +11,13 @@ function Get-PatchVersion([string]$value) {
     return '{0}.{1}.{2}' -f $Matches.major, $Matches.minor, ([int]$Matches.patch + 1)
 }
 
-function Replace-ExactlyOnce([string]$path, [string]$pattern, [string]$replacement) {
-    $content = [System.IO.File]::ReadAllText($path)
+function Get-ReplacedContent([string]$path, [string]$content, [string]$pattern, [string]$replacement) {
     $expression = [regex]::new($pattern)
     if ($expression.Matches($content).Count -ne 1) {
         throw "Expected exactly one matching version field in $path."
     }
 
-    $updated = $expression.Replace($content, $replacement, 1)
-    [System.IO.File]::WriteAllText($path, $updated, [System.Text.UTF8Encoding]::new($false))
+    return $expression.Replace($content, $replacement, 1)
 }
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -37,10 +35,37 @@ if (-not $cargoMatch.Success) {
 $current = $cargoMatch.Groups['version'].Value
 $next = Get-PatchVersion $current
 
-Replace-ExactlyOnce $cargoToml '(?m)^version\s*=\s*"\d+\.\d+\.\d+"\s*$' ('version = "' + $next + '"')
-Replace-ExactlyOnce $electronPackage '(?m)^  "version": "\d+\.\d+\.\d+",$' ('  "version": "' + $next + '",')
-Replace-ExactlyOnce $electronLock '(?s)\A(\{\s+"name": "@deebugee/electron",\s+"version": ")\d+\.\d+\.\d+"' ('${1}' + $next + '"')
-Replace-ExactlyOnce $electronLock '(?s)("packages": \{\s+"": \{\s+"name": "@deebugee/electron",\s+"version": ")\d+\.\d+\.\d+"' ('${1}' + $next + '"')
-Replace-ExactlyOnce $dotnetProject '<Version>\d+\.\d+\.\d+</Version>' ('<Version>' + $next + '</Version>')
+$electronPackageContent = [System.IO.File]::ReadAllText($electronPackage)
+$electronLockContent = [System.IO.File]::ReadAllText($electronLock)
+$dotnetProjectContent = [System.IO.File]::ReadAllText($dotnetProject)
+
+$cargoEol = ([regex]::Match($cargoContent, '(?m)^version\s*=\s*"\d+\.\d+\.\d+"(?<eol>\r?)$')).Groups['eol'].Value
+$electronEol = ([regex]::Match($electronPackageContent, '(?m)^  "version": "\d+\.\d+\.\d+",(?<eol>\r?)$')).Groups['eol'].Value
+$updatedCargo = Get-ReplacedContent $cargoToml $cargoContent '(?m)^version\s*=\s*"\d+\.\d+\.\d+"(?<eol>\r?)$' ('version = "' + $next + '"' + $cargoEol)
+$updatedElectronPackage = Get-ReplacedContent $electronPackage $electronPackageContent '(?m)^  "version": "\d+\.\d+\.\d+",(?<eol>\r?)$' ('  "version": "' + $next + '",' + $electronEol)
+$updatedElectronLock = Get-ReplacedContent $electronLock $electronLockContent '(?s)\A(\{\s+"name": "@deebugee/electron",\s+"version": ")\d+\.\d+\.\d+"' ('${1}' + $next + '"')
+$updatedElectronLock = Get-ReplacedContent $electronLock $updatedElectronLock '(?s)("packages": \{\s+"": \{\s+"name": "@deebugee/electron",\s+"version": ")\d+\.\d+\.\d+"' ('${1}' + $next + '"')
+$updatedDotnetProject = Get-ReplacedContent $dotnetProject $dotnetProjectContent '<Version>\d+\.\d+\.\d+</Version>' ('<Version>' + $next + '</Version>')
+
+$updates = @(
+    [pscustomobject]@{ Path = $cargoToml; Original = $cargoContent; Updated = $updatedCargo }
+    [pscustomobject]@{ Path = $electronPackage; Original = $electronPackageContent; Updated = $updatedElectronPackage }
+    [pscustomobject]@{ Path = $electronLock; Original = $electronLockContent; Updated = $updatedElectronLock }
+    [pscustomobject]@{ Path = $dotnetProject; Original = $dotnetProjectContent; Updated = $updatedDotnetProject }
+)
+
+$written = @()
+try {
+    foreach ($update in $updates) {
+        $written += $update
+        [System.IO.File]::WriteAllText($update.Path, $update.Updated, [System.Text.UTF8Encoding]::new($false))
+    }
+}
+catch {
+    foreach ($update in $written) {
+        [System.IO.File]::WriteAllText($update.Path, $update.Original, [System.Text.UTF8Encoding]::new($false))
+    }
+    throw
+}
 
 Write-Host "Bumped DeeBugee version $current -> $next"
