@@ -27,6 +27,7 @@ use egui_extras::{Column, TableBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::follower::{ReaderCommand, ReaderHandle, ReaderMessage, spawn_reader};
+use crate::update::{self, AvailableUpdate, CheckResult};
 
 const DISPLAYED_FACETS: [&str; 9] = [
     "level",
@@ -103,6 +104,44 @@ struct ProjectConfig {
     id: String,
     name: String,
     sources: Vec<String>,
+}
+
+/// Inputs for creating or replacing the shareable project manifest without
+/// launching the native setup window.
+pub struct ProjectConfiguration {
+    pub root: PathBuf,
+    pub id: String,
+    pub name: String,
+    pub sources: Vec<String>,
+    pub overwrite: bool,
+}
+
+pub fn configure_project(configuration: ProjectConfiguration) -> Result<PathBuf, String> {
+    let root = configuration.root.canonicalize().map_err(|error| {
+        format!(
+            "Unable to resolve project root {}: {error}",
+            configuration.root.display()
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "Project root {} is not a directory",
+            root.display()
+        ));
+    }
+
+    let sources = configuration
+        .sources
+        .iter()
+        .map(|source| manifest_source_argument(&root, source))
+        .collect();
+    let config = ProjectConfig {
+        version: 1,
+        id: configuration.id.trim().to_string(),
+        name: configuration.name.trim().to_string(),
+        sources,
+    };
+    write_project_manifest(&root, &config, configuration.overwrite)
 }
 
 struct ProjectLaunch {
@@ -375,6 +414,19 @@ fn manifest_source_path(project_root: &Path, selected_path: &Path) -> String {
         }
     }
     portable_path(&selected)
+}
+
+fn manifest_source_argument(project_root: &Path, source: &str) -> String {
+    let source = source.trim();
+    if source.starts_with('%') {
+        return source.replace('\\', "/");
+    }
+    let path = PathBuf::from(source);
+    if path.is_absolute() {
+        manifest_source_path(project_root, &path)
+    } else {
+        portable_path(&path)
+    }
 }
 
 fn portable_path(path: &Path) -> String {
@@ -1125,6 +1177,15 @@ struct SearchWorker {
     latest_generation: Arc<AtomicU64>,
 }
 
+#[derive(Debug, Clone, Default)]
+enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    Available(AvailableUpdate),
+    Failed(String),
+}
+
 impl SearchWorker {
     fn spawn(ctx: egui::Context) -> Self {
         let (request_sender, request_receiver) = unbounded::<SearchRequest>();
@@ -1229,6 +1290,9 @@ pub struct ViewerApp {
     table_rows: Vec<usize>,
     error_groups: BTreeMap<usize, ErrorGroup>,
     event_limit_reload_pending: bool,
+    update_receiver: Option<std::sync::mpsc::Receiver<CheckResult>>,
+    update_state: UpdateState,
+    update_check_was_requested: bool,
 }
 
 impl ViewerApp {
@@ -1424,6 +1488,9 @@ impl ViewerApp {
             table_rows: Vec::new(),
             error_groups: BTreeMap::new(),
             event_limit_reload_pending: false,
+            update_receiver: Some(update::check_for_update_async()),
+            update_state: UpdateState::Checking,
+            update_check_was_requested: false,
         };
         app.refresh_filters();
         if !app.filter.text.trim().is_empty() {
@@ -1497,6 +1564,77 @@ impl ViewerApp {
             };
             if visible_tail_changed && self.stick_to_bottom {
                 self.request_scroll_to_latest();
+            }
+        }
+    }
+
+    fn begin_update_check(&mut self) {
+        if matches!(self.update_state, UpdateState::Checking) {
+            return;
+        }
+        self.update_receiver = Some(update::check_for_update_async());
+        self.update_state = UpdateState::Checking;
+        self.update_check_was_requested = true;
+    }
+
+    fn drain_update_check(&mut self) {
+        let Some(receiver) = self.update_receiver.as_ref() else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        self.update_receiver = None;
+        match result {
+            CheckResult::Available(update) => self.update_state = UpdateState::Available(update),
+            CheckResult::Current => {
+                self.update_state = UpdateState::Idle;
+                if self.update_check_was_requested {
+                    self.last_notice = Some("DeeBugee is up to date".to_string());
+                }
+            }
+            CheckResult::Failed(error) => self.update_state = UpdateState::Failed(error),
+        }
+        self.update_check_was_requested = false;
+    }
+
+    fn update_dialog(&mut self, context: &egui::Context) {
+        let UpdateState::Available(update) = &self.update_state else {
+            return;
+        };
+        let update = update.clone();
+        let mut update_now = false;
+        let mut later = false;
+        egui::Window::new("Update available")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(context, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(
+                    RichText::new(format!("DeeBugee {} is available", update.version))
+                        .strong()
+                        .color(TEXT_PRIMARY),
+                );
+                ui.add_space(4.0);
+                ui.label("The update is downloaded from the official GitHub release, verified, then installed after DeeBugee closes.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    update_now = ui.button("Update and Restart").clicked();
+                    later = ui.button("Later").clicked();
+                });
+            });
+        if later {
+            self.update_state = UpdateState::Idle;
+        }
+        if update_now {
+            let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+            match update::start_update(&arguments) {
+                Ok(()) => context.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(error) => {
+                    self.last_error = Some(format!("Unable to start update: {error}"));
+                    self.update_state = UpdateState::Idle;
+                }
             }
         }
     }
@@ -2330,6 +2468,34 @@ impl ViewerApp {
                         });
                     }
                     self.settings_menu(ui);
+                    ui.menu_button("Help", |ui| {
+                        if let UpdateState::Available(update) = &self.update_state {
+                            ui.label(
+                                RichText::new(format!("Update {} Available", update.version))
+                                    .color(SUCCESS),
+                            );
+                            ui.separator();
+                        }
+                        let label = if matches!(self.update_state, UpdateState::Checking) {
+                            "Checking for Updates…"
+                        } else {
+                            "Check for Updates"
+                        };
+                        if ui
+                            .add_enabled(
+                                !matches!(self.update_state, UpdateState::Checking),
+                                egui::Button::new(label),
+                            )
+                            .clicked()
+                        {
+                            self.begin_update_check();
+                            ui.close();
+                        }
+                        if let UpdateState::Failed(error) = &self.update_state {
+                            ui.separator();
+                            ui.label(RichText::new(error).small().color(WARNING));
+                        }
+                    });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let total = self.store.len();
@@ -3867,6 +4033,7 @@ impl eframe::App for ViewerApp {
 
         self.drain_reader();
         self.drain_search_results();
+        self.drain_update_check();
 
         let dropped_paths: Vec<PathBuf> = ui.input(|input| {
             input
@@ -3907,6 +4074,7 @@ impl eframe::App for ViewerApp {
         self.sidebar(ui);
         self.details_panel(ui);
         self.central_table(ui);
+        self.update_dialog(ui.ctx());
 
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
@@ -4580,6 +4748,41 @@ sources = ["logs"]
         write_project_manifest(&root, &config, true).unwrap();
         let saved = load_project_config(&manifest).unwrap();
         assert_eq!(saved.name, "Updated Write Test");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn non_interactive_project_configuration_writes_and_protects_the_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "dee-bugee-project-cli-write-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let manifest = configure_project(ProjectConfiguration {
+            root: root.clone(),
+            id: "com.example.cli-test".to_string(),
+            name: "CLI Test".to_string(),
+            sources: vec!["logs/development".to_string()],
+            overwrite: false,
+        })
+        .unwrap();
+        let saved = load_project_config(&manifest).unwrap();
+        assert_eq!(saved.id, "com.example.cli-test");
+        assert_eq!(saved.name, "CLI Test");
+        assert_eq!(saved.sources, ["logs/development"]);
+
+        assert!(
+            configure_project(ProjectConfiguration {
+                root: root.clone(),
+                id: "com.example.cli-test".to_string(),
+                name: "CLI Test".to_string(),
+                sources: vec!["logs/development".to_string()],
+                overwrite: false,
+            })
+            .is_err()
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }

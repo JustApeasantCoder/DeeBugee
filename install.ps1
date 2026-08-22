@@ -11,7 +11,7 @@ stable user-level directory. Project repositories are not modified.
 .\install.ps1 -AddToPath
 
 .EXAMPLE
-.\install.ps1 -Version 1.0.21 -AddToPath
+.\install.ps1 -Version 1.0.30 -AddToPath
 #>
 [CmdletBinding()]
 param(
@@ -31,7 +31,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $repository = "JustApeasantCoder/DeeBugee"
-$assetName = "dee-bugee.exe"
+$assetNames = @("dee-bugee.exe", "dee-bugee-updater.exe")
 $apiHeaders = @{
     Accept                 = "application/vnd.github+json"
     "User-Agent"           = "DeeBugee-Installer"
@@ -102,47 +102,67 @@ else {
 
 Write-Host "Fetching DeeBugee release metadata..."
 $release = Invoke-RestMethod -Uri $releaseEndpoint -Headers $apiHeaders
-$asset = @($release.assets | Where-Object { $_.name -eq $assetName })
-
-if ($asset.Count -ne 1) {
-    throw "Expected exactly one '$assetName' asset in release '$($release.tag_name)', but found $($asset.Count)."
+$assets = foreach ($assetName in $assetNames) {
+    $asset = @($release.assets | Where-Object { $_.name -eq $assetName })
+    if ($asset.Count -ne 1) {
+        throw "Expected exactly one '$assetName' asset in release '$($release.tag_name)', but found $($asset.Count)."
+    }
+    $digest = [string]$asset[0].digest
+    if ($digest -notmatch "^sha256:([0-9a-fA-F]{64})$") {
+        throw "Release asset '$assetName' does not provide a valid SHA-256 digest. Installation was stopped."
+    }
+    [PSCustomObject]@{
+        Name = $assetName
+        DownloadUrl = $asset[0].browser_download_url
+        ExpectedHash = $Matches[1].ToUpperInvariant()
+    }
 }
-
-$digest = [string]$asset[0].digest
-if ($digest -notmatch "^sha256:([0-9a-fA-F]{64})$") {
-    throw "Release asset '$assetName' does not provide a valid SHA-256 digest. Installation was stopped."
-}
-$expectedHash = $Matches[1].ToUpperInvariant()
 
 $resolvedInstallDirectory = [IO.Path]::GetFullPath($InstallDirectory)
 [IO.Directory]::CreateDirectory($resolvedInstallDirectory) | Out-Null
-$destination = Join-Path $resolvedInstallDirectory $assetName
-$stagedDownload = Join-Path $resolvedInstallDirectory ".$assetName.download.$([Guid]::NewGuid().ToString('N'))"
-$backup = Join-Path $resolvedInstallDirectory ".$assetName.backup.$([Guid]::NewGuid().ToString('N'))"
+$stagedDownloads = @()
+$backups = @()
 $previousProgressPreference = $ProgressPreference
 
 try {
     $ProgressPreference = "SilentlyContinue"
-    Write-Host "Downloading $assetName $($release.tag_name)..."
-    Invoke-WebRequest -Uri $asset[0].browser_download_url -Headers $apiHeaders -OutFile $stagedDownload -UseBasicParsing
+    foreach ($asset in $assets) {
+        $stagedDownload = Join-Path $resolvedInstallDirectory ".${($asset.Name)}.download.$([Guid]::NewGuid().ToString('N'))"
+        $stagedDownloads += $stagedDownload
+        Write-Host "Downloading $($asset.Name) $($release.tag_name)..."
+        Invoke-WebRequest -Uri $asset.DownloadUrl -Headers $apiHeaders -OutFile $stagedDownload -UseBasicParsing
 
-    $actualHash = (Get-FileHash -LiteralPath $stagedDownload -Algorithm SHA256).Hash.ToUpperInvariant()
-    if ($actualHash -ne $expectedHash) {
-        throw "SHA-256 verification failed for '$assetName'. Installation was stopped."
+        $actualHash = (Get-FileHash -LiteralPath $stagedDownload -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($actualHash -ne $asset.ExpectedHash) {
+            throw "SHA-256 verification failed for '$($asset.Name)'. Installation was stopped."
+        }
     }
 
-    if (Test-Path -LiteralPath $destination -PathType Leaf) {
-        [IO.File]::Replace($stagedDownload, $destination, $backup, $true)
-        Remove-Item -LiteralPath $backup -Force
-    }
-    else {
-        [IO.File]::Move($stagedDownload, $destination)
+    foreach ($index in 0..($assets.Count - 1)) {
+        $asset = $assets[$index]
+        $destination = Join-Path $resolvedInstallDirectory $asset.Name
+        $stagedDownload = $stagedDownloads[$index]
+        $backup = Join-Path $resolvedInstallDirectory ".${($asset.Name)}.backup.$([Guid]::NewGuid().ToString('N'))"
+        if (Test-Path -LiteralPath $destination -PathType Leaf) {
+            [IO.File]::Replace($stagedDownload, $destination, $backup, $true)
+            $backups += $backup
+        }
+        else {
+            [IO.File]::Move($stagedDownload, $destination)
+        }
     }
 }
 finally {
     $ProgressPreference = $previousProgressPreference
-    if (Test-Path -LiteralPath $stagedDownload) {
-        Remove-Item -LiteralPath $stagedDownload -Force
+    foreach ($stagedDownload in $stagedDownloads) {
+        if (Test-Path -LiteralPath $stagedDownload) {
+            Remove-Item -LiteralPath $stagedDownload -Force
+        }
+    }
+    foreach ($backup in $backups) {
+        if (Test-Path -LiteralPath $backup) {
+            Remove-Item -LiteralPath $backup -Force
+        }
     }
 }
 
@@ -151,7 +171,7 @@ if ($AddToPath) {
 }
 
 Write-Host "Installed DeeBugee $($release.tag_name) to:"
-Write-Host $destination
+Write-Host (Join-Path $resolvedInstallDirectory "dee-bugee.exe")
 if (-not $AddToPath) {
     Write-Host "Run with -AddToPath if you want to use 'dee-bugee.exe' from any terminal."
 }

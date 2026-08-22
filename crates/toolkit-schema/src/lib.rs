@@ -173,6 +173,7 @@ impl LogEvent {
     }
 
     pub fn tag(&self) -> String {
+        const MAX_TAG_CHARACTERS: usize = 64;
         const CONTEXT_SEGMENTS: [&str; 7] = [
             "backend", "frontend", "local", "remote", "renderer", "settings", "sidecar",
         ];
@@ -183,7 +184,7 @@ impl LogEvent {
             .split('[')
             .skip(1)
             .map_while(|segment| segment.split_once(']').map(|(value, _)| value.trim()))
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty() && value.chars().count() <= MAX_TAG_CHARACTERS)
             .collect();
         let selected = message_segments
             .iter()
@@ -479,5 +480,12 @@ mod tests {
         event.message = "Cache inventory refreshed".to_string();
         event.subsystem = "audio_normalizer.storage".to_string();
         assert_eq!(event.tag(), "Audio Normalizer");
+
+        event.message = format!("[{}] Request failed", "x".repeat(65));
+        event.subsystem = "playback.stream".to_string();
+        assert_eq!(event.tag(), "Playback");
+
+        event.message = format!("[{}] Request started", "x".repeat(64));
+        assert_eq!(event.tag(), "x".repeat(64));
     }
 }

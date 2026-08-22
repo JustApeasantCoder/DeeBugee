@@ -1,0 +1,44 @@
+schema_version = 1
+id = "deebugee"
+name = "DeeBugee"
+description = "Native structured-log viewer and local integration adapters"
+
+[project]
+working_directory = "."
+
+[artifacts]
+paths = ["target/release/dee-bugee.exe"]
+
+[[actions]]
+id = "start-desktop"
+label = "Start Desktop"
+program = "pwsh"
+args = ["-NoLogo", "-NoProfile", "-File", "scripts/Run-Dev.ps1"]
+kind = "long_running"
+terminal = "captured"
+concurrency = "replace_same_action"
+
+[[actions]]
+id = "build-portable"
+label = "Build Portable"
+program = "cmd.exe"
+args = ["/d", "/c", "BUILD.bat"]
+kind = "task"
+terminal = "captured"
+confirm = true
+
+[[actions]]
+id = "push-release"
+label = "Push Release"
+program = "cmd.exe"
+args = ["/d", "/c", "RELEASE.bat"]
+kind = "task"
+terminal = "captured"
+confirm = true
+
+[[actions]]
+id = "open-project-folder"
+label = "Open Project Folder"
+operation = "open_project_folder"
+kind = "task"
+terminal = "hidden"

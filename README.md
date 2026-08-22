@@ -33,7 +33,7 @@ Application → JSONL files → DeeBugee
 
 ### Windows portable executable
 
-Download the [latest portable DeeBugee executable](https://github.com/JustApeasantCoder/DeeBugee/releases/latest), then run `dee-bugee.exe`. No installer or Rust toolchain is required. Open a JSONL file from the picker, drag one onto the window, or pass its path on the command line:
+Download the [latest portable DeeBugee release](https://github.com/JustApeasantCoder/DeeBugee/releases/latest), keeping `dee-bugee.exe` and `dee-bugee-updater.exe` together, then run `dee-bugee.exe`. No installer or Rust toolchain is required. Open a JSONL file from the picker, drag one onto the window, or pass its path on the command line:
 
 ```powershell
 .\dee-bugee.exe "C:\Logs\Application.jsonl"
@@ -57,6 +57,12 @@ The built executable can run on Windows without Rust installed:
 target\release\dee-bugee.exe
 ```
 
+Build both executables before copying a portable build elsewhere:
+
+```powershell
+cargo build --release -p dee-bugee --bins
+```
+
 To open your own JSONL file after building:
 
 ```powershell
@@ -75,17 +81,33 @@ Invoke-WebRequest https://raw.githubusercontent.com/JustApeasantCoder/DeeBugee/m
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -AddToPath
 ```
 
-The installer places `dee-bugee.exe` in `%LOCALAPPDATA%\Programs\DeeBugee` and, with `-AddToPath`, adds that directory to your user `PATH`. Open a new terminal after the first installation. Running the same commands later updates the shared executable without changing project manifests or saved workspace state.
+The installer places `dee-bugee.exe` and its updater companion in `%LOCALAPPDATA%\Programs\DeeBugee` and, with `-AddToPath`, adds that directory to your user `PATH`. Open a new terminal after the first installation. Running the same commands later updates the shared executable without changing project manifests or saved workspace state.
+
+DeeBugee checks for a newer official GitHub release in the background. When one is available, choose **Help → Check for Updates → Update and Restart**. It downloads the release files, verifies their SHA-256 digests, replaces them only after DeeBugee exits, then restarts with the same logs, workspace, or project arguments. Checks never install updates without your confirmation.
+
+Each published release must upload both `dee-bugee.exe` and `dee-bugee-updater.exe`; GitHub must generate a SHA-256 digest for each asset.
 
 To install a specific release, pass its version without or with the leading `v`:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -Version 1.0.21 -AddToPath
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -Version 1.0.30 -AddToPath
 ```
 
 Cloning this repository is only for contributing to DeeBugee; application developers do not need the Cargo workspace, adapters, tests, or source tree. You may still download the portable executable manually from the releases page if you prefer.
 
 ### Configure a project
+
+For a scripted, non-interactive setup, create the project manifest directly:
+
+```powershell
+dee-bugee.exe --configure-project . --project-id "com.example.my-application" --project-name "My Application" --source "%LOCALAPPDATA%/MyApplication/logs" --source "logs/development"
+```
+
+`--source` can be repeated. Absolute paths beneath Local AppData are normalized
+to `%LOCALAPPDATA%`; paths inside the project should normally be supplied as
+relative paths. The command refuses to replace an existing manifest unless you
+add `--force`. It writes `.deebugee/project.toml` and exits without opening a
+window, so installers and onboarding scripts do not need mouse interaction.
 
 From the application repository, launch DeeBugee in project mode:
 
@@ -196,7 +218,7 @@ Supported levels are `trace`, `debug`, `info`, `warn`, `error`, and `fatal`. Tim
 
 ### Tags
 
-`tag` is a viewer-derived facet, not a required JSONL property. DeeBugee derives it from the first meaningful bracketed message prefix, then falls back to `subsystem`. Context prefixes such as `Settings`, `Frontend`, `Backend`, `Local`, and `Remote` are ignored when a more specific feature follows them. For example, `[Search][Local] Results refreshed` is grouped under `Search`, while `[Settings][WhisperLive] Enabled` is grouped under `WhisperLive`.
+`tag` is a viewer-derived facet, not a required JSONL property. DeeBugee derives it from the first meaningful bracketed message prefix, then falls back to `subsystem`. Bracketed tag candidates are limited to 64 characters; a longer candidate is ignored so it cannot become a noisy facet value. Context prefixes such as `Settings`, `Frontend`, `Backend`, `Local`, and `Remote` are ignored when a more specific feature follows them. For example, `[Search][Local] Results refreshed` is grouped under `Search`, while `[Settings][WhisperLive] Enabled` is grouped under `WhisperLive`.
 
 You do not need to write a `tag` property. Use a consistent bracketed feature prefix in `message` when you want explicit grouping; the built-in Tag facet then keeps related frontend and backend events together automatically.
 
@@ -318,10 +340,6 @@ Use `RUN.bat` for local development:
 ```
 
 It runs the debug build through the included development watcher. Saving Rust source changes recompiles and restarts the native viewer; this is the native-app equivalent of Vite hot reload. `RUN.bat` never changes the application version. Stop the reload loop with `Ctrl+C`.
-
-### Publish a release
-
-After installing [GitHub CLI](https://cli.github.com/) and completing `gh auth login` once, run `RELEASE.bat` from a clean, up-to-date `main` branch. It increments the synchronized patch version, builds the portable executable, commits and pushes the release source, then creates the GitHub release and uploads `dee-bugee.exe`.
 
 ### Validation
 
