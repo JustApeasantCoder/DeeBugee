@@ -778,7 +778,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "dee-bugee"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "anyhow",
  "chrono",
@@ -805,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "dee-bugee-core"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "chrono",
  "dee-bugee-schema",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "dee-bugee-rust"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "dee-bugee-schema"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "chrono",
  "serde",
