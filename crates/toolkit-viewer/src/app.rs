@@ -1255,8 +1255,10 @@ pub struct ViewerApp {
     project_setup: Option<ProjectSetup>,
     selected_row: Option<usize>,
     invalid_records: u64,
+    source_load_started_at: BTreeMap<PathBuf, Instant>,
     last_error: Option<String>,
     last_notice: Option<String>,
+    settings_open: bool,
     paused: bool,
     filters_dirty: bool,
     wrapped_messages: bool,
@@ -1453,8 +1455,10 @@ impl ViewerApp {
             project_setup,
             selected_row: None,
             invalid_records: 0,
+            source_load_started_at: BTreeMap::new(),
             last_error: startup_error,
             last_notice: None,
+            settings_open: false,
             paused: false,
             filters_dirty: true,
             wrapped_messages,
@@ -1514,6 +1518,48 @@ impl ViewerApp {
                 Ok(ReaderMessage::Batch(events)) => {
                     self.store.extend(events);
                     received_events = true;
+                }
+                Ok(ReaderMessage::InitialLoadStarted {
+                    path,
+                    file_size_bytes,
+                }) => {
+                    self.source_load_started_at
+                        .insert(path.clone(), Instant::now());
+                    tracing::info!(
+                        target: "deebugee.diagnostics",
+                        subsystem = "ingestion",
+                        event = "viewer.source_load.started",
+                        status = "started",
+                        source_path = %path.display(),
+                        file_size_bytes,
+                        "[Load] Initial source load started"
+                    );
+                }
+                Ok(ReaderMessage::InitialLoadCompleted {
+                    path,
+                    file_size_bytes,
+                    event_count,
+                    invalid_count,
+                    duration,
+                }) => {
+                    let end_to_end_duration = self
+                        .source_load_started_at
+                        .remove(&path)
+                        .map(|started_at| started_at.elapsed())
+                        .map_or(duration, |app_duration| app_duration.max(duration));
+                    tracing::info!(
+                        target: "deebugee.diagnostics",
+                        subsystem = "ingestion",
+                        event = "viewer.source_load.completed",
+                        status = "completed",
+                        duration_ms = end_to_end_duration.as_secs_f64() * 1_000.0,
+                        reader_duration_ms = duration.as_secs_f64() * 1_000.0,
+                        source_path = %path.display(),
+                        file_size_bytes,
+                        event_count,
+                        invalid_count,
+                        "[Load] Initial source load completed"
+                    );
                 }
                 Ok(ReaderMessage::InvalidRecord { path, line, error }) => {
                     self.invalid_records += 1;
@@ -1955,6 +2001,7 @@ impl ViewerApp {
         self.sources = paths;
         self.selected_row = None;
         self.invalid_records = 0;
+        self.source_load_started_at.clear();
         self.last_error = None;
         self.last_discarded_events = 0;
         self.search_generation = self.search_worker.next_generation();
@@ -2653,12 +2700,21 @@ impl ViewerApp {
     }
 
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
-        egui::menu::MenuButton::new("Settings")
-            .config(
-                egui::menu::MenuConfig::new()
-                    .close_behavior(PopupCloseBehavior::CloseOnClickOutside),
-            )
-            .ui(ui, |ui| {
+        let button_response = ui.button("Settings");
+        let settings_button_clicked = button_response.clicked();
+        let mut settings_open = self.settings_open;
+        if settings_button_clicked {
+            settings_open = !settings_open;
+        }
+
+        // egui memory permits only one ordinary popup at a time. Keep Settings on
+        // explicit state so opening a ComboBox does not replace its parent popup,
+        // then exclude the nested popup rectangles from our outside-click handling.
+        let mut nested_popup_rects = Vec::new();
+        let popup_response = egui::Popup::menu(&button_response)
+            .open_bool(&mut settings_open)
+            .close_behavior(PopupCloseBehavior::IgnoreClicks)
+            .show(|ui| {
             ui.set_min_width(340.0);
 
             ui.label(RichText::new("Interface").strong());
@@ -2707,6 +2763,11 @@ impl ViewerApp {
                         ui.selectable_value(&mut self.latest_at, option, option.title());
                     }
                 });
+            if let Some(response) = ui.ctx().read_response(
+                ui.make_persistent_id("settings_latest_at").with("popup"),
+            ) {
+                nested_popup_rects.push(response.interact_rect);
+            }
             if self.latest_at != previous_latest_at {
                 self.filter_changed();
             }
@@ -2739,6 +2800,11 @@ impl ViewerApp {
                         ui.selectable_value(&mut self.color_by, option, option.title());
                     }
                 });
+            if let Some(response) = ui.ctx().read_response(
+                ui.make_persistent_id("settings_color_by").with("popup"),
+            ) {
+                nested_popup_rects.push(response.interact_rect);
+            }
 
             ui.separator();
             ui.label(RichText::new("Timestamps").strong());
@@ -2754,6 +2820,12 @@ impl ViewerApp {
                 .on_hover_text(
                     "Display UTC log timestamps in your computer's local time, or keep UTC",
                 );
+            if let Some(response) = ui.ctx().read_response(
+                ui.make_persistent_id("settings_timestamp_display")
+                    .with("popup"),
+            ) {
+                nested_popup_rects.push(response.interact_rect);
+            }
             ui.label(RichText::new("Format").small().color(TEXT_MUTED));
             ui.add_sized(
                 [310.0, 26.0],
@@ -2812,6 +2884,26 @@ impl ViewerApp {
                 self.reload_current_sources();
             }
         });
+
+        if let Some(popup_response) = popup_response {
+            let pointer_pos = ui.ctx().pointer_interact_pos();
+            let pointer_in_nested_popup = pointer_pos.is_some_and(|position| {
+                nested_popup_rects
+                    .iter()
+                    .any(|rect| rect.contains(position))
+            });
+            let clicked_outside = should_close_settings_popup(
+                settings_button_clicked,
+                ui.ctx().input(|input| input.pointer.any_click()),
+                popup_response.response.clicked_elsewhere(),
+                pointer_in_nested_popup,
+            );
+            if clicked_outside {
+                settings_open = false;
+            }
+        }
+
+        self.settings_open = settings_open;
     }
 
     fn sidebar(&mut self, root: &mut egui::Ui) {
@@ -4016,6 +4108,15 @@ fn should_reanchor_after_wrap(
     wrap_changed && follow_latest && (was_at_latest || latest_request_pending)
 }
 
+fn should_close_settings_popup(
+    settings_button_clicked: bool,
+    pointer_clicked: bool,
+    clicked_elsewhere: bool,
+    pointer_in_nested_popup: bool,
+) -> bool {
+    !settings_button_clicked && pointer_clicked && clicked_elsewhere && !pointer_in_nested_popup
+}
+
 fn can_refresh_filtered_rows_immediately(
     has_text_filter: bool,
     text_cache_is_current: bool,
@@ -4264,6 +4365,13 @@ fn level_color(level: Level) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_opening_click_is_not_treated_as_an_outside_click() {
+        assert!(!should_close_settings_popup(true, true, true, false));
+        assert!(!should_close_settings_popup(false, true, true, true));
+        assert!(should_close_settings_popup(false, true, true, false));
+    }
 
     #[test]
     fn timestamp_display_keeps_utc_available_for_log_correlation() {

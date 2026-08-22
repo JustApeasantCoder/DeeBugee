@@ -5,12 +5,23 @@ mod follower;
 #[allow(dead_code)]
 mod update;
 
-use std::{ffi::OsString, path::PathBuf, sync::Arc};
+use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Instant};
 
 use app::{LaunchRequest, ProjectConfiguration, ViewerApp, configure_project};
+use dee_bugee_rust::{LoggerConfig, LoggerGuard, non_blocking_layer};
 use eframe::egui;
+use tracing_subscriber::prelude::*;
 
 fn main() -> eframe::Result {
+    let process_started_at = Instant::now();
+    let _diagnostics_guard = initialize_diagnostics();
+    tracing::info!(
+        target: "deebugee.diagnostics",
+        subsystem = "startup",
+        event = "viewer.startup.started",
+        status = "started",
+        "[Startup] Viewer startup started"
+    );
     let launch = match parse_startup_request(std::env::args_os().skip(1).collect()) {
         Ok(StartupRequest::Launch(launch)) => launch,
         Ok(StartupRequest::Configure(configuration)) => {
@@ -34,11 +45,48 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "DeeBugee",
         options,
-        Box::new(move |creation_context| Ok(Box::new(ViewerApp::new(creation_context, launch)))),
-    )
+        Box::new(move |creation_context| {
+            let initialization_started_at = Instant::now();
+            let app = ViewerApp::new(creation_context, launch);
+            tracing::info!(
+                target: "deebugee.diagnostics",
+                subsystem = "startup",
+                event = "viewer.startup.completed",
+                status = "completed",
+                duration_ms = process_started_at.elapsed().as_secs_f64() * 1_000.0,
+                initialization_duration_ms =
+                    initialization_started_at.elapsed().as_secs_f64() * 1_000.0,
+                "[Startup] Viewer initialization completed"
+            );
+            Ok(Box::new(app))
+        }),
+    );
+    tracing::info!(
+        target: "deebugee.diagnostics",
+        subsystem = "startup",
+        event = "viewer.shutdown.completed",
+        status = "completed",
+        "[Startup] Viewer shutdown completed"
+    );
+    result
+}
+
+fn initialize_diagnostics() -> Option<LoggerGuard> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")?;
+    let path = PathBuf::from(local_app_data)
+        .join("DeeBugee")
+        .join("logs")
+        .join("DeeBugee.jsonl");
+    let (layer, guard) = non_blocking_layer(LoggerConfig::new(path, "viewer")).ok()?;
+    let filter = tracing_subscriber::filter::Targets::new()
+        .with_target("deebugee.diagnostics", tracing::Level::TRACE);
+    let subscriber = tracing_subscriber::registry().with(layer.with_filter(filter));
+    tracing::subscriber::set_global_default(subscriber)
+        .ok()
+        .map(|()| guard)
 }
 
 fn application_icon() -> Arc<egui::IconData> {

@@ -4,7 +4,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
@@ -23,6 +23,17 @@ pub enum ReaderCommand {
 #[derive(Debug)]
 pub enum ReaderMessage {
     Batch(Vec<LogEvent>),
+    InitialLoadStarted {
+        path: PathBuf,
+        file_size_bytes: u64,
+    },
+    InitialLoadCompleted {
+        path: PathBuf,
+        file_size_bytes: u64,
+        event_count: u64,
+        invalid_count: u64,
+        duration: Duration,
+    },
     InvalidRecord {
         path: PathBuf,
         line: u64,
@@ -129,6 +140,16 @@ struct FileCursor {
     opened: bool,
     last_error: Option<String>,
     file_identity: Option<FileIdentity>,
+    initial_load: Option<InitialLoad>,
+    initial_load_completed: bool,
+}
+
+#[derive(Debug)]
+struct InitialLoad {
+    started_at: Instant,
+    file_size_bytes: u64,
+    event_count: u64,
+    invalid_count: u64,
 }
 
 impl FileCursor {
@@ -147,10 +168,25 @@ impl FileCursor {
             self.offset = 0;
             self.line = 0;
             self.partial.clear();
+            self.initial_load = None;
+            self.initial_load_completed = false;
         }
         self.file_identity = file_identity;
+        if self.initial_load.is_none() && !self.initial_load_completed {
+            self.initial_load = Some(InitialLoad {
+                started_at: Instant::now(),
+                file_size_bytes: metadata.len(),
+                event_count: 0,
+                invalid_count: 0,
+            });
+            let _ = messages.send(ReaderMessage::InitialLoadStarted {
+                path: path.to_path_buf(),
+                file_size_bytes: metadata.len(),
+            });
+        }
         if metadata.len() == self.offset {
             self.announce_open(path, messages);
+            self.complete_initial_load(path, messages);
             return Ok(());
         }
 
@@ -164,7 +200,12 @@ impl FileCursor {
         self.offset += bytes.len() as u64;
         self.partial.extend_from_slice(&bytes);
         self.announce_open(path, messages);
-        self.parse_complete_lines(path, messages);
+        let (event_count, invalid_count) = self.parse_complete_lines(path, messages);
+        if let Some(load) = &mut self.initial_load {
+            load.event_count += event_count;
+            load.invalid_count += invalid_count;
+        }
+        self.complete_initial_load(path, messages);
         Ok(())
     }
 
@@ -175,12 +216,18 @@ impl FileCursor {
         }
     }
 
-    fn parse_complete_lines(&mut self, path: &Path, messages: &Sender<ReaderMessage>) {
+    fn parse_complete_lines(
+        &mut self,
+        path: &Path,
+        messages: &Sender<ReaderMessage>,
+    ) -> (u64, u64) {
         let Some(last_newline) = self.partial.iter().rposition(|byte| *byte == b'\n') else {
-            return;
+            return (0, 0);
         };
         let complete: Vec<u8> = self.partial.drain(..=last_newline).collect();
         let mut batch = Vec::with_capacity(MAX_BATCH_EVENTS.min(complete.len() / 128 + 1));
+        let mut event_count = 0;
+        let mut invalid_count = 0;
 
         for raw_line in complete.split(|byte| *byte == b'\n') {
             if raw_line.is_empty() {
@@ -190,16 +237,18 @@ impl FileCursor {
             let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
             match serde_json::from_slice::<LogEvent>(raw_line) {
                 Ok(event) => {
+                    event_count += 1;
                     batch.push(event);
                     if batch.len() >= MAX_BATCH_EVENTS
                         && messages
                             .send(ReaderMessage::Batch(std::mem::take(&mut batch)))
                             .is_err()
                     {
-                        return;
+                        return (event_count, invalid_count);
                     }
                 }
                 Err(error) => {
+                    invalid_count += 1;
                     let _ = messages.send(ReaderMessage::InvalidRecord {
                         path: path.to_path_buf(),
                         line: self.line,
@@ -212,6 +261,28 @@ impl FileCursor {
         if !batch.is_empty() {
             let _ = messages.send(ReaderMessage::Batch(batch));
         }
+        (event_count, invalid_count)
+    }
+
+    fn complete_initial_load(&mut self, path: &Path, messages: &Sender<ReaderMessage>) {
+        let should_complete = self
+            .initial_load
+            .as_ref()
+            .is_some_and(|load| self.offset >= load.file_size_bytes);
+        if !should_complete {
+            return;
+        }
+        let Some(load) = self.initial_load.take() else {
+            return;
+        };
+        self.initial_load_completed = true;
+        let _ = messages.send(ReaderMessage::InitialLoadCompleted {
+            path: path.to_path_buf(),
+            file_size_bytes: load.file_size_bytes,
+            event_count: load.event_count,
+            invalid_count: load.invalid_count,
+            duration: load.started_at.elapsed(),
+        });
     }
 }
 
@@ -372,5 +443,43 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(archive);
+    }
+
+    #[test]
+    fn initial_load_telemetry_is_reported_once_with_record_counts() {
+        let path = std::env::temp_dir().join(format!(
+            "dee-bugee-follower-telemetry-{}.jsonl",
+            std::process::id()
+        ));
+        let event = LogEvent::new(Level::Info, "backend", "test", "test", "hello", "app-1");
+        let valid_record = serde_json::to_string(&event).unwrap();
+        std::fs::write(&path, format!("{valid_record}\nnot-json\n")).unwrap();
+        let expected_bytes = std::fs::metadata(&path).unwrap().len();
+        let (sender, receiver) = bounded(8);
+        let mut cursor = FileCursor::default();
+
+        cursor.poll(&path, &sender).unwrap();
+        cursor.poll(&path, &sender).unwrap();
+        let messages = receiver.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, ReaderMessage::InitialLoadStarted { .. }))
+                .count(),
+            1
+        );
+        let completed = messages.iter().find_map(|message| match message {
+            ReaderMessage::InitialLoadCompleted {
+                file_size_bytes,
+                event_count,
+                invalid_count,
+                ..
+            } => Some((*file_size_bytes, *event_count, *invalid_count)),
+            _ => None,
+        });
+        assert_eq!(completed, Some((expected_bytes, 1, 1)));
+
+        let _ = std::fs::remove_file(path);
     }
 }

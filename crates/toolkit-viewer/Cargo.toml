@@ -10,6 +10,7 @@ anyhow.workspace = true
 chrono.workspace = true
 crossbeam-channel.workspace = true
 dee-bugee-core = { path = "../toolkit-core" }
+dee-bugee-rust = { path = "../toolkit-rust" }
 dee-bugee-schema = { path = "../toolkit-schema" }
 eframe.workspace = true
 egui.workspace = true
@@ -21,6 +22,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
