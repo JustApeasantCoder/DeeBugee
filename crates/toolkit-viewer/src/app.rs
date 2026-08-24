@@ -913,6 +913,21 @@ enum LatestAt {
     Top,
 }
 
+#[derive(Clone, Copy)]
+enum LatestNavigationAction {
+    JumpButton,
+    FollowEnabled,
+}
+
+impl LatestNavigationAction {
+    fn event_value(self) -> &'static str {
+        match self {
+            Self::JumpButton => "jump_button",
+            Self::FollowEnabled => "follow_enabled",
+        }
+    }
+}
+
 impl LatestAt {
     const ALL: [Self; 2] = [Self::Bottom, Self::Top];
 
@@ -1687,6 +1702,7 @@ pub struct ViewerApp {
     tail_was_at_bottom: bool,
     scroll_to_bottom_requested: bool,
     scroll_settle_frames: u8,
+    latest_navigation_diagnostic: Option<LatestNavigationAction>,
     scroll_to_selected_requested: bool,
     last_discarded_events: u64,
     search_worker: SearchWorker,
@@ -1934,6 +1950,7 @@ impl ViewerApp {
             tail_was_at_bottom: true,
             scroll_to_bottom_requested: true,
             scroll_settle_frames: LATEST_SETTLE_FRAMES,
+            latest_navigation_diagnostic: None,
             scroll_to_selected_requested: false,
             last_discarded_events: 0,
             search_worker,
@@ -3665,10 +3682,23 @@ impl ViewerApp {
             {
                 if self.stick_to_bottom {
                     self.tail_was_at_bottom = true;
+                    self.latest_navigation_diagnostic =
+                        Some(LatestNavigationAction::FollowEnabled);
+                    tracing::info!(
+                        target: "deebugee.diagnostics",
+                        subsystem = "navigation",
+                        event = "viewer.latest_navigation.requested",
+                        status = "requested",
+                        action = LatestNavigationAction::FollowEnabled.event_value(),
+                        latest_at = self.latest_at.title(),
+                        visible_row_count = self.table_rows.len(),
+                        "[Navigation] Latest-event navigation requested"
+                    );
                     self.request_scroll_to_latest();
                 } else {
                     self.scroll_to_bottom_requested = false;
                     self.scroll_settle_frames = 0;
+                    self.latest_navigation_diagnostic = None;
                 }
             }
             let previous_latest_at = self.latest_at;
@@ -4549,8 +4579,9 @@ impl ViewerApp {
             // Capture this before the nested table consumes it. We apply it only after
             // knowing the pointer is over the table and only when it moves away from
             // the latest edge; a wheel attempt at the edge must not disable following.
-            let (pointer_position, vertical_scroll_delta) = ui.input(|input| {
-                (input.pointer.interact_pos(), input.smooth_scroll_delta.y)
+            let (pointer_position, raw_vertical_scroll_delta) = ui.input(|input| {
+                let raw_vertical_scroll_delta = raw_mouse_wheel_delta_y(&input.raw.events);
+                (input.pointer.interact_pos(), raw_vertical_scroll_delta)
             });
             let column_order = self.column_order.clone();
             let table_rows = &self.table_rows;
@@ -4845,7 +4876,7 @@ impl ViewerApp {
             let vertical_output = &mut horizontal_output.inner;
             let wheel_scrolled_away_from_latest = pointer_position
                 .is_some_and(|position| vertical_output.inner_rect.contains(position))
-                && scroll_delta_moves_away_from_latest(vertical_scroll_delta, latest_at);
+                && scroll_delta_moves_away_from_latest(raw_vertical_scroll_delta, latest_at);
             // TableBuilder does not expose the vertical scrollbar response in this
             // egui version. Treat a primary vertical drag over its viewport or
             // scrollbar gutter as a manual move so it can cancel a pending jump.
@@ -4882,12 +4913,53 @@ impl ViewerApp {
             // This is the only automatic-scroll mechanism. Keep an explicit latest
             // request alive until a subsequent frame reaches the actual edge; new
             // records, Wrap, filter changes, and Jump all use this same path.
+            let previous_scroll_request = self.scroll_to_bottom_requested;
             (self.scroll_to_bottom_requested, self.scroll_settle_frames) = advance_scroll_request(
                 scroll_to_bottom_requested,
                 self.tail_was_at_bottom,
                 manually_scrolled,
                 self.scroll_settle_frames,
             );
+            if previous_scroll_request
+                && !self.scroll_to_bottom_requested
+                && let Some(action) = self.latest_navigation_diagnostic.take()
+            {
+                let maximum_offset = latest_scroll_offset(
+                    vertical_output.content_size.y,
+                    vertical_output.inner_rect.height(),
+                );
+                if manually_scrolled {
+                    tracing::warn!(
+                        target: "deebugee.diagnostics",
+                        subsystem = "navigation",
+                        event = "viewer.latest_navigation.canceled",
+                        status = "canceled",
+                        action = action.event_value(),
+                        latest_at = latest_at.title(),
+                        raw_scroll_delta_y = raw_vertical_scroll_delta,
+                        middle_panned,
+                        scrollbar_dragged,
+                        current_offset = vertical_output.state.offset.y,
+                        maximum_offset,
+                        "[Navigation] Latest-event navigation canceled by manual input"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "deebugee.diagnostics",
+                        subsystem = "navigation",
+                        event = "viewer.latest_navigation.completed",
+                        status = "completed",
+                        action = action.event_value(),
+                        latest_at = latest_at.title(),
+                        current_offset = vertical_output.state.offset.y,
+                        maximum_offset,
+                        content_height = vertical_output.content_size.y,
+                        viewport_height = vertical_output.inner_rect.height(),
+                        visible_row_count = table_rows.len(),
+                        "[Navigation] Latest-event navigation completed"
+                    );
+                }
+            }
             if self.scroll_to_bottom_requested {
                 ui.ctx().request_repaint();
             }
@@ -4932,6 +5004,18 @@ impl ViewerApp {
                     .clicked();
                 if jump_clicked {
                     self.tail_was_at_bottom = true;
+                    self.latest_navigation_diagnostic =
+                        Some(LatestNavigationAction::JumpButton);
+                    tracing::info!(
+                        target: "deebugee.diagnostics",
+                        subsystem = "navigation",
+                        event = "viewer.latest_navigation.requested",
+                        status = "requested",
+                        action = LatestNavigationAction::JumpButton.event_value(),
+                        latest_at = latest_at.title(),
+                        visible_row_count = table_rows.len(),
+                        "[Navigation] Latest-event navigation requested"
+                    );
                     self.request_scroll_to_latest();
                 }
             }
@@ -5429,6 +5513,16 @@ fn scroll_delta_moves_away_from_latest(scroll_delta: f32, latest_at: LatestAt) -
         LatestAt::Bottom => scroll_delta > f32::EPSILON,
         LatestAt::Top => scroll_delta < -f32::EPSILON,
     }
+}
+
+fn raw_mouse_wheel_delta_y(events: &[egui::Event]) -> f32 {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+            _ => None,
+        })
+        .sum()
 }
 
 fn order_visible_rows(rows: &mut [usize], latest_at: LatestAt) {
@@ -6426,6 +6520,21 @@ mod tests {
         assert!(!scroll_delta_moves_away_from_latest(-1.0, LatestAt::Bottom));
         assert!(scroll_delta_moves_away_from_latest(-1.0, LatestAt::Top));
         assert!(!scroll_delta_moves_away_from_latest(1.0, LatestAt::Top));
+    }
+
+    #[test]
+    fn pending_jump_cancellation_uses_only_current_raw_wheel_events() {
+        let events = vec![
+            egui::Event::PointerGone,
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 12.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        assert_eq!(raw_mouse_wheel_delta_y(&events), 12.0);
+        assert_eq!(raw_mouse_wheel_delta_y(&[]), 0.0);
     }
 
     #[test]
