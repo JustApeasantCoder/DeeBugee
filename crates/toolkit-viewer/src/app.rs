@@ -1440,6 +1440,8 @@ struct ViewerPreferences {
     timestamp_display: TimestampDisplay,
     timestamp_format: String,
     group_errors: bool,
+    #[serde(default)]
+    show_fields: bool,
     #[serde(default = "default_ui_scale")]
     ui_scale: f32,
 }
@@ -1467,6 +1469,7 @@ impl Default for ViewerPreferences {
             timestamp_display: TimestampDisplay::default(),
             timestamp_format: default_timestamp_format(),
             group_errors: false,
+            show_fields: false,
             ui_scale: DEFAULT_UI_SCALE,
         }
     }
@@ -1509,6 +1512,8 @@ struct WorkspaceConfig {
     timestamp_format: String,
     #[serde(default)]
     group_errors: bool,
+    #[serde(default)]
+    show_fields: bool,
 }
 
 impl WorkspaceConfig {
@@ -1532,6 +1537,7 @@ impl WorkspaceConfig {
             timestamp_display: TimestampDisplay::default(),
             timestamp_format: default_timestamp_format(),
             group_errors: false,
+            show_fields: false,
         }
     }
 }
@@ -1695,6 +1701,7 @@ pub struct ViewerApp {
     timestamp_display: TimestampDisplay,
     timestamp_format: String,
     group_errors: bool,
+    show_fields: bool,
     ui_scale: f32,
     table_rows: Vec<usize>,
     error_groups: BTreeMap<usize, ErrorGroup>,
@@ -1837,6 +1844,10 @@ impl ViewerApp {
             .as_ref()
             .map(|workspace| workspace.group_errors)
             .unwrap_or(preferences.group_errors);
+        let show_fields = workspace
+            .as_ref()
+            .map(|workspace| workspace.show_fields)
+            .unwrap_or(preferences.show_fields);
         let bookmark_scope = bookmark_scope_key(&paths_to_open);
         let mut bookmarks_by_source = preferences.bookmarks_by_source;
         let bookmarks = workspace.as_ref().map_or_else(
@@ -1937,6 +1948,7 @@ impl ViewerApp {
             timestamp_display,
             timestamp_format,
             group_errors,
+            show_fields,
             ui_scale: preferences.ui_scale,
             table_rows: Vec::new(),
             error_groups: BTreeMap::new(),
@@ -2605,6 +2617,7 @@ impl ViewerApp {
             timestamp_display: self.timestamp_display,
             timestamp_format: self.timestamp_format.clone(),
             group_errors: self.group_errors,
+            show_fields: self.show_fields,
         }
     }
 
@@ -2649,6 +2662,7 @@ impl ViewerApp {
                 self.timestamp_display = workspace.timestamp_display;
                 self.timestamp_format = workspace.timestamp_format;
                 self.group_errors = workspace.group_errors;
+                self.show_fields = workspace.show_fields;
                 self.facet_order = normalize_facet_order(workspace.facet_order);
                 self.hidden_facets = workspace.hidden_facets;
                 self.replace_paths(workspace.sources);
@@ -3413,6 +3427,18 @@ impl ViewerApp {
                     {
                         self.group_errors = !self.group_errors;
                         self.rebuild_table_rows();
+                        if self.tail_was_at_bottom {
+                            self.request_scroll_to_latest();
+                        }
+                    }
+                    if ui
+                        .add(egui::Button::new("Show Fields").selected(self.show_fields))
+                        .on_hover_text(
+                            "Show structured args and remaining fields beneath each message.",
+                        )
+                        .clicked()
+                    {
+                        self.show_fields = !self.show_fields;
                         if self.tail_was_at_bottom {
                             self.request_scroll_to_latest();
                         }
@@ -4532,6 +4558,7 @@ impl ViewerApp {
             let store = &self.store;
             let wrapped = self.wrapped_messages;
             let semantic_highlighting = self.semantic_highlighting;
+            let show_fields = self.show_fields;
             let color_by = self.color_by;
             let latest_at = self.latest_at;
             let timestamp_display = self.timestamp_display;
@@ -4691,19 +4718,28 @@ impl ViewerApp {
                                     let group_detail = error_groups
                                         .get(index)
                                         .and_then(|group| error_group_summary(store, *group, timestamp_display, timestamp_format));
-                                    let detail_lines = usize::from(console_argument_summary(event).is_some())
+                                    let field_details = event_field_summaries(event, show_fields);
+                                    let legacy_detail = (!show_fields)
+                                        .then(|| console_argument_summary(event))
+                                        .flatten();
+                                    let detail_lines = field_details.len()
+                                        + usize::from(legacy_detail.is_some())
                                         + usize::from(group_detail.is_some());
                                     if !wrapped {
                                         return row_height * (1 + detail_lines) as f32;
                                     }
-                                    let chars = event.message.chars().count()
-                                        + console_argument_summary(event)
-                                            .map_or(0, |detail| detail.chars().count() + 1)
-                                        + group_detail.map_or(0, |detail| detail.chars().count() + 1);
                                     let characters_per_line = (message_width / 7.2).max(12.0);
-                                    let lines = ((chars as f32 / characters_per_line).ceil()
-                                        as usize)
-                                        .max(1 + detail_lines)
+                                    let lines = std::iter::once(event.message.as_str())
+                                        .chain(legacy_detail.as_deref())
+                                        .chain(field_details.iter().map(String::as_str))
+                                        .chain(group_detail.as_deref())
+                                        .map(|detail| {
+                                            ((detail.chars().count() as f32
+                                                / characters_per_line)
+                                                .ceil() as usize)
+                                                .max(1)
+                                        })
+                                        .sum::<usize>()
                                         .clamp(1, 12);
                                     row_height * lines as f32
                                 })
@@ -4748,6 +4784,7 @@ impl ViewerApp {
                                                 timestamp_format,
                                                 relative_start: session_starts.get(&event.app_session_id).copied(),
                                                 group_detail: group_detail.as_deref(),
+                                                show_fields,
                                             },
                                         );
                                     });
@@ -5025,6 +5062,7 @@ struct EventCellOptions<'a> {
     timestamp_format: &'a str,
     relative_start: Option<DateTime<Utc>>,
     group_detail: Option<&'a str>,
+    show_fields: bool,
 }
 
 fn show_event_cell(
@@ -5104,7 +5142,17 @@ fn show_event_cell(
                 } else {
                     label.truncate()
                 });
-                if let Some(detail) = console_argument_summary(event) {
+                if !options.show_fields
+                    && let Some(detail) = console_argument_summary(event)
+                {
+                    let detail_label = Label::new(RichText::new(detail).color(TEXT_MUTED));
+                    ui.add(if options.wrapped {
+                        detail_label.wrap()
+                    } else {
+                        detail_label.truncate()
+                    });
+                }
+                for detail in event_field_summaries(event, options.show_fields) {
                     let detail_label = Label::new(RichText::new(detail).color(TEXT_MUTED));
                     ui.add(if options.wrapped {
                         detail_label.wrap()
@@ -5274,6 +5322,37 @@ fn console_argument_summary(event: &LogEvent) -> Option<String> {
     }
 
     (!details.is_empty()).then(|| details.join(" · "))
+}
+
+fn event_field_summaries(event: &LogEvent, show_fields: bool) -> Vec<String> {
+    if !show_fields || event.fields.is_empty() {
+        return Vec::new();
+    }
+
+    let mut details = Vec::new();
+    if let Some(arguments) = event
+        .fields
+        .get("arguments")
+        .or_else(|| event.fields.get("args"))
+    {
+        details.push(format!(
+            "args: {}",
+            serde_json::to_string(arguments).unwrap_or_else(|_| "<unavailable>".to_owned())
+        ));
+    }
+
+    let remaining = event
+        .fields
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "arguments" | "args"))
+        .collect::<BTreeMap<_, _>>();
+    if !remaining.is_empty() {
+        details.push(format!(
+            "fields: {}",
+            serde_json::to_string(&remaining).unwrap_or_else(|_| "<unavailable>".to_owned())
+        ));
+    }
+    details
 }
 
 fn optional_cell(ui: &mut egui::Ui, value: Option<&str>) {
@@ -5511,6 +5590,7 @@ impl eframe::App for ViewerApp {
             timestamp_display: self.timestamp_display,
             timestamp_format: self.timestamp_format.clone(),
             group_errors: self.group_errors,
+            show_fields: self.show_fields,
             ui_scale: self.ui_scale,
         };
         eframe::set_value(storage, PREFERENCES_KEY, &preferences);
@@ -6033,6 +6113,34 @@ mod tests {
 
         event.event = "player.failed".to_string();
         assert_eq!(console_argument_summary(&event), None);
+    }
+
+    #[test]
+    fn field_summaries_separate_args_from_remaining_fields() {
+        let mut event = LogEvent::new(
+            Level::Info,
+            "renderer",
+            "player",
+            "console.message",
+            "[Player] Started",
+            "session",
+        );
+        event.fields.insert(
+            "arguments".to_string(),
+            serde_json::json!(["[Player] Started", { "attempt": 2 }]),
+        );
+        event
+            .fields
+            .insert("provider".to_string(), serde_json::json!("native"));
+
+        assert!(event_field_summaries(&event, false).is_empty());
+        assert_eq!(
+            event_field_summaries(&event, true),
+            vec![
+                "args: [\"[Player] Started\",{\"attempt\":2}]".to_string(),
+                "fields: {\"provider\":\"native\"}".to_string(),
+            ]
+        );
     }
 
     #[test]
