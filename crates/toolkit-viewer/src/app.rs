@@ -4584,6 +4584,10 @@ impl ViewerApp {
             self.pin_bar(ui);
 
             let row_height = ui.text_style_height(&TextStyle::Body) + 8.0;
+            let body_font_id = TextStyle::Body.resolve(ui.style());
+            let small_font_id = TextStyle::Small.resolve(ui.style());
+            let vertical_item_spacing = ui.spacing().item_spacing.y;
+            let text_layout_context = ui.ctx().clone();
             // Capture this before the nested table consumes it. We apply it only after
             // knowing the pointer is over the table and only when it moves away from
             // the latest edge; a wheel attempt at the edge must not disable following.
@@ -4767,26 +4771,19 @@ impl ViewerApp {
                                     let legacy_detail = (!show_fields)
                                         .then(|| console_argument_summary(event))
                                         .flatten();
-                                    let detail_lines = field_details.len()
-                                        + usize::from(legacy_detail.is_some())
-                                        + usize::from(group_detail.is_some());
-                                    if !wrapped {
-                                        return row_height * (1 + detail_lines) as f32;
-                                    }
-                                    let characters_per_line = (message_width / 7.2).max(12.0);
-                                    let lines = std::iter::once(event.message.as_str())
-                                        .chain(legacy_detail.as_deref())
-                                        .chain(field_details.iter().map(String::as_str))
-                                        .chain(group_detail.as_deref())
-                                        .map(|detail| {
-                                            ((detail.chars().count() as f32
-                                                / characters_per_line)
-                                                .ceil() as usize)
-                                                .max(1)
-                                        })
-                                        .sum::<usize>()
-                                        .clamp(1, 12);
-                                    row_height * lines as f32
+                                    event_message_row_height(
+                                        &text_layout_context,
+                                        event.message.as_str(),
+                                        legacy_detail.as_deref(),
+                                        &field_details,
+                                        group_detail.as_deref(),
+                                        wrapped,
+                                        message_width,
+                                        row_height,
+                                        vertical_item_spacing,
+                                        &body_font_id,
+                                        &small_font_id,
+                                    )
                                 })
                                 .chain(std::iter::once(row_height * TAIL_HEADROOM_ROWS))
                                 .collect();
@@ -5465,6 +5462,91 @@ fn event_field_summaries(event: &LogEvent, show_fields: bool) -> Vec<String> {
         ));
     }
     details
+}
+
+const MAX_APPROXIMATE_WRAPPED_LINES: usize = 12;
+
+#[allow(clippy::too_many_arguments)]
+fn event_message_row_height(
+    context: &egui::Context,
+    message: &str,
+    legacy_detail: Option<&str>,
+    field_details: &[String],
+    group_detail: Option<&str>,
+    wrapped: bool,
+    message_width: f32,
+    row_height: f32,
+    vertical_item_spacing: f32,
+    body_font_id: &FontId,
+    small_font_id: &FontId,
+) -> f32 {
+    let detail_count = field_details.len()
+        + usize::from(legacy_detail.is_some())
+        + usize::from(group_detail.is_some());
+    if !wrapped {
+        return row_height * (1 + detail_count) as f32;
+    }
+
+    let estimated_lines = std::iter::once(message)
+        .chain(legacy_detail)
+        .chain(field_details.iter().map(String::as_str))
+        .chain(group_detail)
+        .map(|text| approximate_wrapped_line_count(text, message_width))
+        .sum::<usize>()
+        .max(1);
+    if estimated_lines <= MAX_APPROXIMATE_WRAPPED_LINES {
+        // The existing estimate is intentionally generous for ordinary rows and
+        // avoids laying out every message in a large virtualized table.
+        return row_height * estimated_lines as f32;
+    }
+
+    // Large details must use the same font engine as Label. A fixed line cap makes
+    // the virtual table shorter than the content that is actually painted, which
+    // also makes its scrollbar and latest-edge calculations incorrect.
+    let wrap_width = message_width.max(1.0);
+    let (content_height, body_line_height, label_count) = context.fonts_mut(|fonts| {
+        let body_line_height = fonts.row_height(body_font_id);
+        let mut content_height = 0.0;
+        let mut label_count = 0_usize;
+        for text in std::iter::once(message)
+            .chain(legacy_detail)
+            .chain(field_details.iter().map(String::as_str))
+        {
+            content_height += fonts
+                .layout(
+                    text.to_owned(),
+                    body_font_id.clone(),
+                    Color32::WHITE,
+                    wrap_width,
+                )
+                .size()
+                .y;
+            label_count += 1;
+        }
+        if let Some(detail) = group_detail {
+            content_height += fonts
+                .layout(
+                    detail.to_owned(),
+                    small_font_id.clone(),
+                    Color32::WHITE,
+                    wrap_width,
+                )
+                .size()
+                .y;
+            label_count += 1;
+        }
+        (content_height, body_line_height, label_count)
+    });
+    let inter_label_spacing = vertical_item_spacing * label_count.saturating_sub(1) as f32;
+    let baseline_padding = (row_height - body_line_height).max(0.0);
+    (content_height + inter_label_spacing + baseline_padding).max(row_height)
+}
+
+fn approximate_wrapped_line_count(text: &str, message_width: f32) -> usize {
+    let characters_per_line = (message_width / 7.2).max(12.0);
+    text.split('\n')
+        .map(|line| ((line.chars().count() as f32 / characters_per_line).ceil() as usize).max(1))
+        .sum()
 }
 
 fn optional_cell(ui: &mut egui::Ui, value: Option<&str>) {
@@ -6311,6 +6393,41 @@ mod tests {
                 "fields: {\"provider\":\"native\"}".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn oversized_wrapped_fields_expand_the_virtual_row_past_the_old_line_cap() {
+        let context = egui::Context::default();
+        let _ = context.run_ui(Default::default(), |ui| {
+            let row_height = 22.0;
+            let body_font_id = FontId::new(14.0, FontFamily::Proportional);
+            let small_font_id = FontId::new(11.0, FontFamily::Proportional);
+            let detail = format!("fields: {{\"payload\":\"{}\"}}", "wide value ".repeat(180));
+            let message_width = 180.0;
+
+            assert!(
+                approximate_wrapped_line_count(&detail, message_width)
+                    > MAX_APPROXIMATE_WRAPPED_LINES
+            );
+            let measured_height = event_message_row_height(
+                ui.ctx(),
+                "[RIFE] Session verified",
+                None,
+                &[detail],
+                Some("Repeated 124 times"),
+                true,
+                message_width,
+                row_height,
+                ui.spacing().item_spacing.y,
+                &body_font_id,
+                &small_font_id,
+            );
+
+            assert!(
+                measured_height > row_height * MAX_APPROXIMATE_WRAPPED_LINES as f32,
+                "measured={measured_height}, row={row_height}"
+            );
+        });
     }
 
     #[test]
