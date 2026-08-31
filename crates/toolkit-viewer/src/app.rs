@@ -1990,7 +1990,8 @@ impl ViewerApp {
             latest_visible_id(&self.store, &self.visible_rows, self.latest_at);
         // Capture the visible tail before this can release deferred pruning. Otherwise
         // a pruning pass can shift indexes before the change detector sees it.
-        self.store.set_pruning_paused(!self.tail_was_at_bottom);
+        self.store
+            .set_pruning_paused(should_pause_pruning(self.paused, self.tail_was_at_bottom));
         let mut received_events = false;
         loop {
             match self.reader.messages.try_recv() {
@@ -2145,8 +2146,15 @@ impl ViewerApp {
                 self.schedule_text_search(Duration::ZERO);
             }
         }
-        if received_events && !self.paused && self.tail_was_at_bottom {
+        let refresh_decision =
+            ingestion_refresh_decision(received_events, self.paused, self.tail_was_at_bottom);
+        if refresh_decision.mark_filters_dirty {
+            // Keep newly ingested rows pending while the user reads history. Jumping
+            // or manually returning to Latest will rebuild the table on the next frame,
+            // even if the source becomes quiet before then.
             self.filters_dirty = true;
+        }
+        if refresh_decision.refresh_anchored_view {
             // A hidden record or an older-row prune must not move the log viewport.
             // When the current filter can be evaluated synchronously, compare the
             // visible tail before and after ingestion and follow only if the newest
@@ -4595,6 +4603,12 @@ impl ViewerApp {
             let timestamp_display = self.timestamp_display;
             let timestamp_format = &self.timestamp_format;
             let scroll_to_bottom_requested = self.scroll_to_bottom_requested;
+            let latest_view_is_current = latest_view_is_current(
+                self.filters_dirty,
+                !self.filter.text.trim().is_empty(),
+                self.cached_search_is_current(),
+            );
+            let was_at_latest_before_table = self.tail_was_at_bottom;
             let scroll_to_selected_requested = self.scroll_to_selected_requested;
             let selected_scroll_row = self.selected_row.and_then(|selected| {
                 self.table_rows.iter().position(|row| *row == selected)
@@ -4877,14 +4891,15 @@ impl ViewerApp {
             let wheel_scrolled_away_from_latest = pointer_position
                 .is_some_and(|position| vertical_output.inner_rect.contains(position))
                 && scroll_delta_moves_away_from_latest(raw_vertical_scroll_delta, latest_at);
-            // TableBuilder does not expose the vertical scrollbar response in this
-            // egui version. Treat a primary vertical drag over its viewport or
-            // scrollbar gutter as a manual move so it can cancel a pending jump.
-            let scrollbar_dragged = primary_down
-                && pointer_position.is_some_and(|position| {
-                    horizontal_output.inner_rect.expand(12.0).contains(position)
-                })
-                && pointer_delta.y.abs() > f32::EPSILON;
+            // The table exposes its nested ScrollArea id even though it does not
+            // expose the scrollbar Response. egui's vertical handle uses id.with(1),
+            // which lets us distinguish a real scrollbar drag from text selection,
+            // row clicks, and column resizing elsewhere in the table.
+            let scrollbar_dragged = vertical_scrollbar_dragged(
+                ui.ctx().dragged_id(),
+                vertical_output.id,
+                primary_down,
+            );
             let manually_scrolled = wheel_scrolled_away_from_latest
                 || (middle_panned && pointer_delta.y.abs() > f32::EPSILON)
                 || scrollbar_dragged;
@@ -4918,6 +4933,7 @@ impl ViewerApp {
                 scroll_to_bottom_requested,
                 self.tail_was_at_bottom,
                 manually_scrolled,
+                latest_view_is_current,
                 self.scroll_settle_frames,
             );
             if previous_scroll_request
@@ -4960,9 +4976,12 @@ impl ViewerApp {
                     );
                 }
             }
-            if self.scroll_to_bottom_requested {
-                ui.ctx().request_repaint();
-            }
+            let resume_follow_after_deferred_refresh = should_resume_follow_at_latest_edge(
+                self.stick_to_bottom,
+                was_at_latest_before_table,
+                self.tail_was_at_bottom,
+                latest_view_is_current,
+            );
 
             self.selected_row = selected;
             self.scroll_to_selected_requested = false;
@@ -5018,6 +5037,15 @@ impl ViewerApp {
                     );
                     self.request_scroll_to_latest();
                 }
+            }
+            if resume_follow_after_deferred_refresh {
+                // The user reached the edge of the previously rendered table while
+                // newer rows or search results were pending. Carry that intent into
+                // the next frame so the refreshed table remains anchored to Latest.
+                self.request_scroll_to_latest();
+            }
+            if self.scroll_to_bottom_requested {
+                ui.ctx().request_repaint();
             }
         });
     }
@@ -5555,12 +5583,13 @@ fn advance_scroll_request(
     requested: bool,
     reached_bottom: bool,
     manually_scrolled: bool,
+    latest_view_is_current: bool,
     settle_frames: u8,
 ) -> (bool, u8) {
     if !requested || manually_scrolled {
         return (false, 0);
     }
-    if !reached_bottom {
+    if !latest_view_is_current || !reached_bottom {
         return (true, LATEST_SETTLE_FRAMES);
     }
     let remaining = settle_frames.saturating_sub(1);
@@ -5590,6 +5619,53 @@ fn can_refresh_filtered_rows_immediately(
     text_cache_is_current: bool,
 ) -> bool {
     !has_text_filter || text_cache_is_current
+}
+
+fn latest_view_is_current(
+    filters_dirty: bool,
+    has_text_filter: bool,
+    text_cache_is_current: bool,
+) -> bool {
+    !filters_dirty && (!has_text_filter || text_cache_is_current)
+}
+
+fn should_resume_follow_at_latest_edge(
+    follow_latest: bool,
+    was_at_latest: bool,
+    is_at_latest: bool,
+    latest_view_is_current: bool,
+) -> bool {
+    follow_latest && !was_at_latest && is_at_latest && !latest_view_is_current
+}
+
+fn should_pause_pruning(paused: bool, tail_was_at_bottom: bool) -> bool {
+    paused || !tail_was_at_bottom
+}
+
+fn vertical_scrollbar_dragged(
+    dragged_id: Option<egui::Id>,
+    scroll_area_id: egui::Id,
+    primary_down: bool,
+) -> bool {
+    primary_down && dragged_id == Some(scroll_area_id.with(1))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IngestionRefreshDecision {
+    mark_filters_dirty: bool,
+    refresh_anchored_view: bool,
+}
+
+fn ingestion_refresh_decision(
+    received_events: bool,
+    paused: bool,
+    tail_was_at_bottom: bool,
+) -> IngestionRefreshDecision {
+    let mark_filters_dirty = received_events && !paused;
+    IngestionRefreshDecision {
+        mark_filters_dirty,
+        refresh_anchored_view: mark_filters_dirty && tail_was_at_bottom,
+    }
 }
 
 impl eframe::App for ViewerApp {
@@ -6540,16 +6616,19 @@ mod tests {
     #[test]
     fn tail_request_survives_until_the_new_offset_reaches_bottom() {
         assert_eq!(
-            advance_scroll_request(true, false, false, LATEST_SETTLE_FRAMES),
+            advance_scroll_request(true, false, false, true, LATEST_SETTLE_FRAMES),
             (true, LATEST_SETTLE_FRAMES)
         );
         assert_eq!(
-            advance_scroll_request(true, true, false, LATEST_SETTLE_FRAMES),
+            advance_scroll_request(true, true, false, true, LATEST_SETTLE_FRAMES),
             (true, 1)
         );
-        assert_eq!(advance_scroll_request(true, true, false, 1), (false, 0));
         assert_eq!(
-            advance_scroll_request(true, false, true, LATEST_SETTLE_FRAMES),
+            advance_scroll_request(true, true, false, true, 1),
+            (false, 0)
+        );
+        assert_eq!(
+            advance_scroll_request(true, false, true, true, LATEST_SETTLE_FRAMES),
             (false, 0)
         );
     }
@@ -6568,6 +6647,115 @@ mod tests {
         assert!(can_refresh_filtered_rows_immediately(false, false));
         assert!(can_refresh_filtered_rows_immediately(true, true));
         assert!(!can_refresh_filtered_rows_immediately(true, false));
+    }
+
+    #[test]
+    fn ingestion_keeps_new_rows_pending_while_away_from_latest() {
+        assert_eq!(
+            ingestion_refresh_decision(true, false, false),
+            IngestionRefreshDecision {
+                mark_filters_dirty: true,
+                refresh_anchored_view: false,
+            }
+        );
+        assert_eq!(
+            ingestion_refresh_decision(true, false, true),
+            IngestionRefreshDecision {
+                mark_filters_dirty: true,
+                refresh_anchored_view: true,
+            }
+        );
+        assert_eq!(
+            ingestion_refresh_decision(true, true, false),
+            IngestionRefreshDecision {
+                mark_filters_dirty: false,
+                refresh_anchored_view: false,
+            }
+        );
+    }
+
+    #[test]
+    fn latest_request_waits_for_deferred_rows_and_search_results() {
+        // Reaching the edge of the old table is not completion while its filtered
+        // presentation is stale.
+        assert_eq!(
+            advance_scroll_request(true, true, false, false, 1),
+            (true, LATEST_SETTLE_FRAMES)
+        );
+        // Once the refreshed table appears, the same request survives until that
+        // larger table reaches its actual edge and settles.
+        assert_eq!(
+            advance_scroll_request(true, false, false, true, LATEST_SETTLE_FRAMES),
+            (true, LATEST_SETTLE_FRAMES)
+        );
+        assert_eq!(
+            advance_scroll_request(true, true, false, true, LATEST_SETTLE_FRAMES),
+            (true, 1)
+        );
+        assert_eq!(
+            advance_scroll_request(true, true, false, true, 1),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn returning_to_a_stale_edge_resumes_following() {
+        assert!(should_resume_follow_at_latest_edge(
+            true, false, true, false
+        ));
+        assert!(!should_resume_follow_at_latest_edge(
+            false, false, true, false
+        ));
+        assert!(!should_resume_follow_at_latest_edge(
+            true, true, true, false
+        ));
+        assert!(!should_resume_follow_at_latest_edge(
+            true, false, true, true
+        ));
+    }
+
+    #[test]
+    fn pause_keeps_the_retained_window_and_selection_identity_stable() {
+        let mut store = EventStore::new(2);
+        let event =
+            |message| LogEvent::new(Level::Info, "test", "viewer", "event", message, "session");
+        store.extend([event("first"), event("selected")]);
+        let selected_id = store.event_id(1).unwrap();
+
+        store.set_pruning_paused(should_pause_pruning(true, true));
+        store.push(event("new while paused"));
+
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.event_id(1), Some(selected_id));
+
+        store.set_pruning_paused(should_pause_pruning(false, true));
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.event_id(0), Some(selected_id));
+    }
+
+    #[test]
+    fn only_the_actual_vertical_scrollbar_drag_cancels_navigation() {
+        let scroll_area_id = egui::Id::new("test_scroll_area");
+        assert!(vertical_scrollbar_dragged(
+            Some(scroll_area_id.with(1)),
+            scroll_area_id,
+            true
+        ));
+        assert!(!vertical_scrollbar_dragged(
+            Some(egui::Id::new("selected_text")),
+            scroll_area_id,
+            true
+        ));
+        assert!(!vertical_scrollbar_dragged(
+            Some(scroll_area_id.with(0)),
+            scroll_area_id,
+            true
+        ));
+        assert!(!vertical_scrollbar_dragged(
+            Some(scroll_area_id.with(1)),
+            scroll_area_id,
+            false
+        ));
     }
 
     #[test]

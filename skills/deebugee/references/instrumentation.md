@@ -34,7 +34,7 @@ Preserve user privacy and operational safety. Never emit secrets or private payl
 
 ### Rust and Tauri
 
-Use `dee-bugee-rust::non_blocking_layer(LoggerConfig)` with the existing `tracing` subscriber. `LoggerConfig::new` creates an app session ID and defaults to a bounded 16,384-event queue, 50 MiB active file, and four archives; adjust only for a measured need. Keep `LoggerGuard` alive through shutdown so the worker drains.
+Use `dee-bugee-rust::non_blocking_layer(LoggerConfig)` with the existing `tracing` subscriber. `LoggerConfig::new` creates an app session ID and defaults to a bounded 16,384-event queue, 50 MiB active file, and four archives. For new application integrations, prefer a 50 MiB active file with one archive (two JSONL files, about 100 MiB total) unless measured diagnostic needs justify retaining more history. Keep `LoggerGuard` alive through shutdown so the worker drains.
 
 The tracing layer promotes `playback_session_id`, `request_id`, `session_id`, `provider`, `duration_ms`, `error_kind`, and `status`; remaining tracing fields become `fields`. It reports queue pressure as `logger.events_dropped`. Use a narrow Tauri command or existing bridge for renderer batches, then write them through the backend-owned path. Do not grant renderer filesystem access.
 
@@ -48,7 +48,7 @@ The main writer validates events, bounds batch count/bytes, rotates the active f
 
 ### .NET
 
-Register `AddDeeBugee(ToolkitLoggerOptions)` on the existing `Microsoft.Extensions.Logging` builder. Dispose the provider or containing `LoggerFactory` so the bounded channel drains. Defaults match the Rust adapter's queue and rotation policy.
+Register `AddDeeBugee(ToolkitLoggerOptions)` on the existing `Microsoft.Extensions.Logging` builder. Dispose the provider or containing `LoggerFactory` so the bounded channel drains. Defaults match the Rust adapter's queue and rotation policy; apply the same one-archive recommendation for a roughly 100 MiB application log budget unless the user requests otherwise.
 
 Use structured template properties named `subsystem`, `event`, `playback_session_id`, `request_id`, `session_id`, `provider`, `duration_ms`, `error_kind`, and `status` for promotion. The logger category becomes `target` and is the subsystem fallback; `EventId` supplies the event fallback. Exceptions supply `error_kind` when it was not provided. Remaining structured properties become redacted `fields`.
 
@@ -61,7 +61,6 @@ Create the parent directory and append one serialized event plus `\n` at complet
 - One application run has stable session identity, and async/process handoffs preserve the intended correlation.
 - Event names and categorical values are bounded; messages remain readable; useful scalars become facets.
 - Success, failure, cancellation, timeout, retry, and fallback paths use accurate severity/outcome semantics where they exist.
-- Queues, retention, rotation, shutdown flush, and write-failure behavior fit the application's volume and lifecycle.
+- Queues, retention, rotation, shutdown flush, and write-failure behavior fit the application's volume and lifecycle. Unless the application has a measured need for deeper history, confirm retention is one active JSONL plus one archive rather than accepting a larger adapter default implicitly.
 - Fresh JSONL contains complete valid v1 lines, no secrets, no avoidable duplicates, and no unexplained dropped/rejected-event warnings.
 - DeeBugee can isolate the intended trail by Tag/correlation/facets and inspect complete details; filtered export contains the underlying matching events.
-
