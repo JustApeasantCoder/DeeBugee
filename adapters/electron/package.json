@@ -1,6 +1,6 @@
 {
   "name": "@deebugee/electron",
-  "version": "1.0.40",
+  "version": "1.0.41",
   "description": "Electron main and renderer adapters for DeeBugee JSONL logs",
   "repository": {
     "type": "git",
