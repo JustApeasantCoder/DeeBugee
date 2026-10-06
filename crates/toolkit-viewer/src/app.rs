@@ -1294,6 +1294,21 @@ fn session_start_times(
 impl TableColumn {
     const ALL: [Self; 12] = [
         Self::Timestamp,
+        Self::Level,
+        Self::Message,
+        Self::Tag,
+        Self::Source,
+        Self::Subsystem,
+        Self::RelativeTime,
+        Self::Event,
+        Self::Provider,
+        Self::Correlation,
+        Self::Duration,
+        Self::Status,
+    ];
+
+    const LEGACY_DEFAULT_ORDER: [Self; 12] = [
+        Self::Timestamp,
         Self::RelativeTime,
         Self::Level,
         Self::Source,
@@ -1337,7 +1352,7 @@ impl TableColumn {
             Self::Correlation => Column::initial(145.0),
             Self::Duration => Column::initial(82.0),
             Self::Status => Column::initial(70.0),
-            Self::Message => Column::remainder(),
+            Self::Message => Column::remainder().at_least(360.0),
         }
     }
 }
@@ -1369,6 +1384,18 @@ fn normalize_saved_column_order(
     mut columns: Vec<TableColumn>,
     relative_time_column: bool,
 ) -> Vec<TableColumn> {
+    let legacy_without_relative = TableColumn::LEGACY_DEFAULT_ORDER
+        .into_iter()
+        .filter(|column| *column != TableColumn::RelativeTime);
+    // Adopt the new default only for untouched layouts, including workspaces
+    // saved before the Relative column was introduced.
+    if columns.is_empty()
+        || columns == TableColumn::ALL
+        || columns == TableColumn::LEGACY_DEFAULT_ORDER
+        || columns.iter().copied().eq(legacy_without_relative)
+    {
+        return default_column_order();
+    }
     if !relative_time_column {
         columns.retain(|column| *column != TableColumn::RelativeTime);
     }
@@ -6603,6 +6630,44 @@ mod tests {
                 TableColumn::Source,
                 TableColumn::Timestamp,
             ]
+        );
+    }
+
+    #[test]
+    fn saved_default_layouts_adopt_the_current_column_order() {
+        let legacy_without_relative = TableColumn::LEGACY_DEFAULT_ORDER
+            .into_iter()
+            .filter(|column| *column != TableColumn::RelativeTime)
+            .collect();
+        for (columns, relative_time_column) in [
+            (TableColumn::LEGACY_DEFAULT_ORDER.to_vec(), true),
+            (legacy_without_relative, false),
+            (default_column_order(), false),
+            (Vec::new(), false),
+        ] {
+            assert_eq!(
+                normalize_saved_column_order(columns, relative_time_column),
+                default_column_order()
+            );
+        }
+    }
+
+    #[test]
+    fn customized_column_orders_survive_workspace_round_trips() {
+        let mut workspace = WorkspaceConfig::new(vec![PathBuf::from("test.jsonl")]);
+        workspace.column_order = TableColumn::LEGACY_DEFAULT_ORDER.to_vec();
+        move_column(
+            &mut workspace.column_order,
+            TableColumn::Message,
+            TableColumn::Level,
+            true,
+        );
+
+        let encoded = toml::to_string(&workspace).unwrap();
+        let decoded: WorkspaceConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            normalize_saved_column_order(decoded.column_order, decoded.relative_time_column),
+            workspace.column_order
         );
     }
 
